@@ -10,39 +10,79 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import java.io.IOException
 import java.util.concurrent.TimeUnit
 
+/**
+ * 合成请求参数
+ */
+data class TtsRequest(
+    val model: String,                          // 模型 ID
+    val text: String,                           // assistant 消息（可含风格/音频标签）
+    val style: String? = null,                  // user 消息（风格指令 / 音色描述）
+    val voice: String? = null,                  // 预置音色名 或 data:...;base64 克隆音频
+    val optimizeTextPreview: Boolean = false    // voicedesign 智能润色
+)
+
 class XiaomiTtsClient(private val apiKey: String) {
 
     companion object {
         private const val API_BASE_URL = "https://token-plan-cn.xiaomimimo.com/v1"
+
+        /** 预置音色列表（文档：预置音色仅 mimo-v2.5-tts 支持） */
+        val PRESET_VOICES = listOf(
+            "mimo_default" to "默认",
+            "冰糖" to "冰糖 · 中文女",
+            "茉莉" to "茉莉 · 中文女",
+            "苏打" to "苏打 · 中文男",
+            "白桦" to "白桦 · 中文男",
+            "Mia" to "Mia · 英文女",
+            "Chloe" to "Chloe · 英文女",
+            "Milo" to "Milo · 英文男",
+            "Dean" to "Dean · 英文男"
+        )
+
+        /** 风格标签（拼接在文本开头） */
+        val STYLE_TAGS = listOf(
+            "开心", "悲伤", "愤怒", "恐惧", "惊讶", "兴奋", "委屈", "平静", "冷漠",
+            "温柔", "高冷", "活泼", "严肃", "慵懒", "俏皮", "深沉", "干练",
+            "磁性", "醇厚", "清亮", "空灵", "甜美", "沙哑",
+            "东北话", "四川话", "河南话", "粤语",
+            "唱歌", "孙悟空", "林黛玉", "御姐音", "大叔音", "正太音", "台湾腔"
+        )
+
+        /** 音频标签（插入光标处，细粒度控制） */
+        val AUDIO_TAGS = listOf(
+            "叹气", "深呼吸", "吸气", "长叹一口气", "沉默片刻",
+            "笑", "轻笑", "大笑", "冷笑",
+            "哽咽", "抽泣", "呜咽", "哭",
+            "小声", "大声", "气声", "颤抖", "语速加快", "语速放慢",
+            "紧张", "疲惫", "激动", "撒娇", "心虚", "震惊", "不耐烦"
+        )
+
+        /** 音色设计模板 */
+        val VOICE_DESIGN_TEMPLATES = listOf(
+            "一位年迈的老先生，说带北方口音的普通话，语速缓慢而沉稳，嗓音略带沙哑和沧桑感，仿佛一位饱经风霜的老爷爷在讲故事，充满岁月的智慧。",
+            "Young female, gentle and soothing voice, speaks slowly, like a late-night radio host telling bedtime stories.",
+            "五十多岁的中年男性，声音丝滑醇厚、带着磁性，像纪录片旁白一样沉稳有力。",
+            "Gruff middle-aged male, blunt and matter-of-fact, with a heavy Russian accent."
+        )
+
+        /** 克隆音频转成 API 要求的 data URI（base64 后不超过 10MB） */
+        fun buildCloneVoice(mime: String, audioBytes: ByteArray): String {
+            val encoded = Base64.encodeToString(audioBytes, Base64.NO_WRAP)
+            val dataUri = "data:$mime;base64,$encoded"
+            if (dataUri.length > 10 * 1024 * 1024) {
+                throw IOException("音频样本过大（base64 后超 10MB），请裁剪后再试")
+            }
+            return dataUri
+        }
     }
 
     private val client = OkHttpClient.Builder()
         .connectTimeout(30, TimeUnit.SECONDS)
-        .readTimeout(180, TimeUnit.SECONDS)
-        .writeTimeout(30, TimeUnit.SECONDS)
+        .readTimeout(300, TimeUnit.SECONDS)
+        .writeTimeout(60, TimeUnit.SECONDS)
         .build()
 
     private val gson = Gson()
-
-    private fun buildMessages(text: String, style: String?): MutableList<JsonObject> {
-        val messages = mutableListOf<JsonObject>()
-        if (!style.isNullOrBlank()) {
-            messages.add(JsonObject().apply {
-                addProperty("role", "user")
-                addProperty("content", style)
-            })
-        }
-        messages.add(JsonObject().apply {
-            addProperty("role", "assistant")
-            addProperty("content", text)
-        })
-        return messages
-    }
-
-    private fun headers(): Headers = Headers.Builder()
-        .add("Authorization", "Bearer $apiKey")
-        .add("Content-Type", "application/json")
-        .build()
 
     private fun parseError(response: Response): IOException {
         val errBody = try {
@@ -50,31 +90,50 @@ class XiaomiTtsClient(private val apiKey: String) {
         } catch (e: Exception) {
             ""
         }
-        return IOException("API 调用失败: ${response.code} - ${errBody.take(300)}")
+        return IOException("API ${response.code}: ${errBody.take(300)}")
     }
 
     /**
      * 文本转语音（非流式，返回 WAV 音频）
      */
-    fun synthesize(
-        text: String,
-        model: String = "mimo-v2.5-tts",
-        style: String? = null
-    ): ByteArray {
+    fun synthesize(req: TtsRequest): ByteArray {
+        val messages = mutableListOf<JsonObject>()
+
+        // user 消息：voicedesign 时为音色描述（必填）；其他模式为可选风格指令；voiceclone 可为空串
+        val userContent = when (req.model) {
+            "mimo-v2.5-tts-voicedesign" -> req.style ?: throw IOException("音色设计模式需要填写音色描述")
+            "mimo-v2.5-tts-voiceclone" -> req.style ?: ""
+            else -> req.style.takeUnless { it.isNullOrBlank() }
+        }
+        if (userContent != null) {
+            messages.add(JsonObject().apply {
+                addProperty("role", "user")
+                addProperty("content", userContent)
+            })
+        }
+
+        // assistant 消息：目标文本（TTS 模型必需）
+        messages.add(JsonObject().apply {
+            addProperty("role", "assistant")
+            addProperty("content", req.text)
+        })
+
         val requestBody = JsonObject().apply {
-            addProperty("model", model)
-            add("messages", gson.toJsonTree(buildMessages(text, style)))
+            addProperty("model", req.model)
+            add("messages", gson.toJsonTree(messages))
             addProperty("stream", false)
-            // 必须声明音频模态，否则服务端报错
             add("modalities", gson.toJsonTree(listOf("text", "audio")))
             add("audio", JsonObject().apply {
                 addProperty("format", "wav")
+                if (req.voice != null) addProperty("voice", req.voice)
+                if (req.optimizeTextPreview) addProperty("optimize_text_preview", true)
             })
         }
 
         val request = Request.Builder()
             .url("$API_BASE_URL/chat/completions")
-            .headers(headers())
+            .addHeader("Authorization", "Bearer $apiKey")
+            .addHeader("Content-Type", "application/json")
             .post(requestBody.toString().toRequestBody("application/json".toMediaType()))
             .build()
 
@@ -88,101 +147,18 @@ class XiaomiTtsClient(private val apiKey: String) {
 
         val jsonResponse = JsonParser.parseString(responseBody).asJsonObject
         val choices = jsonResponse.getAsJsonArray("choices")
-
         if (choices == null || choices.size() == 0) {
             throw IOException("无效的响应格式")
         }
 
-        val choice = choices[0].asJsonObject
-        val message = choice.getAsJsonObject("message")
+        val message = choices[0].asJsonObject.getAsJsonObject("message")
+            ?: throw IOException("响应中没有 message")
 
-        if (message == null || !message.has("audio")) {
+        if (!message.has("audio") || message.get("audio").isJsonNull) {
             throw IOException("响应中没有音频数据")
         }
 
         val audio = message.getAsJsonObject("audio")
-        val audioData = audio.get("data").asString
-
-        return Base64.decode(audioData, Base64.DEFAULT)
-    }
-
-    /**
-     * 流式文本转语音（返回 PCM16 数据）
-     */
-    fun synthesizeStream(
-        text: String,
-        model: String = "mimo-v2.5-tts",
-        style: String? = null,
-        onProgress: ((ByteArray) -> Unit)? = null
-    ): ByteArray {
-        val requestBody = JsonObject().apply {
-            addProperty("model", model)
-            add("messages", gson.toJsonTree(buildMessages(text, style)))
-            addProperty("stream", true)
-            add("modalities", gson.toJsonTree(listOf("text", "audio")))
-            add("audio", JsonObject().apply {
-                addProperty("format", "pcm16")
-            })
-        }
-
-        val request = Request.Builder()
-            .url("$API_BASE_URL/chat/completions")
-            .headers(headers())
-            .post(requestBody.toString().toRequestBody("application/json".toMediaType()))
-            .build()
-
-        val response = client.newCall(request).execute()
-
-        if (!response.isSuccessful) {
-            throw parseError(response)
-        }
-
-        val audioChunks = mutableListOf<ByteArray>()
-
-        response.body?.source()?.use { source ->
-            while (!source.exhausted()) {
-                val line = source.readUtf8Line() ?: break
-
-                if (line.startsWith("data: ")) {
-                    val dataStr = line.substring(6)
-                    if (dataStr.trim() == "[DONE]") {
-                        break
-                    }
-
-                    try {
-                        val chunk = JsonParser.parseString(dataStr).asJsonObject
-                        val choices = chunk.getAsJsonArray("choices")
-
-                        if (choices != null && choices.size() > 0) {
-                            val choice = choices[0].asJsonObject
-                            val delta = choice.getAsJsonObject("delta")
-
-                            if (delta != null && delta.has("audio") && !delta.get("audio").isJsonNull) {
-                                val audio = delta.getAsJsonObject("audio")
-                                if (audio != null && audio.has("data") && !audio.get("data").isJsonNull) {
-                                    val audioData = audio.get("data").asString
-                                    val decodedData = Base64.decode(audioData, Base64.DEFAULT)
-                                    audioChunks.add(decodedData)
-                                    onProgress?.invoke(decodedData)
-                                }
-                            }
-                        }
-                    } catch (e: Exception) {
-                        continue
-                    }
-                }
-            }
-        }
-
-        val totalSize = audioChunks.sumOf { it.size }
-        val result = ByteArray(totalSize)
-        var offset = 0
-
-        for (chunk in audioChunks) {
-            System.arraycopy(chunk, 0, result, offset, chunk.size)
-            offset += chunk.size
-        }
-
-        return result
+        return Base64.decode(audio.get("data").asString, Base64.DEFAULT)
     }
 }

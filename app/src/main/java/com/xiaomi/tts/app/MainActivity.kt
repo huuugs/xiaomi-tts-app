@@ -15,6 +15,7 @@ import com.xiaomi.tts.app.ui.theme.XiaomiTtsAppTheme
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        HistoryStore.init(this)
         setContent {
             XiaomiTtsAppTheme {
                 Surface(
