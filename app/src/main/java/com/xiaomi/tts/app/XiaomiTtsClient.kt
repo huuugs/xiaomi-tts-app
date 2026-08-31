@@ -110,12 +110,36 @@ class XiaomiTtsClient(private val apiKey: String) {
 
             chunks.forEachIndexed { i, chunk ->
                 onProgress(i + 1, chunks.size)
-                val segs = analyzeChunk(apiKey, chunk, knownSpeakers)
+                val segs = analyzeChunkWithRetry(apiKey, chunk, knownSpeakers)
                 result += segs
                 segs.filter { it.isDialogue && it.speaker != "未标注" }
                     .forEach { knownSpeakers.add(it.speaker) }
             }
             return result
+        }
+
+        /** 带重试的单块分析（网络中断自动退避重试） */
+        private fun analyzeChunkWithRetry(
+            apiKey: String,
+            chunk: String,
+            knownSpeakers: Set<String>,
+            retries: Int = 3
+        ): List<NovelSegment> {
+            var lastError: IOException? = null
+            for (attempt in 0..retries) {
+                try {
+                    return analyzeChunk(apiKey, chunk, knownSpeakers)
+                } catch (e: IOException) {
+                    lastError = e
+                    if (attempt < retries) {
+                        try {
+                            Thread.sleep((attempt + 1) * 4000L)
+                        } catch (_: InterruptedException) {
+                        }
+                    }
+                }
+            }
+            throw lastError ?: IOException("未知错误")
         }
 
         private fun analyzeChunk(
@@ -281,6 +305,27 @@ class XiaomiTtsClient(private val apiKey: String) {
 
         val audio = message.getAsJsonObject("audio")
         return Base64.decode(audio.get("data").asString, Base64.DEFAULT)
+    }
+
+    /**
+     * 带重试的合成（网络抖动自动退避重试，仅重试 IO 错误）
+     */
+    fun synthesizeWithRetry(req: TtsRequest, retries: Int = 3): ByteArray {
+        var lastError: IOException? = null
+        for (attempt in 0..retries) {
+            try {
+                return synthesize(req)
+            } catch (e: IOException) {
+                lastError = e
+                if (attempt < retries) {
+                    try {
+                        Thread.sleep((attempt + 1) * 3000L)
+                    } catch (_: InterruptedException) {
+                    }
+                }
+            }
+        }
+        throw lastError ?: IOException("未知错误")
     }
 
     /**

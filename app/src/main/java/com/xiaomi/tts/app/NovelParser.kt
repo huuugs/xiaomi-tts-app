@@ -1,11 +1,59 @@
 package com.xiaomi.tts.app
 
+import android.content.Context
+import com.google.gson.Gson
+import java.io.File
 import java.nio.ByteBuffer
 import java.nio.charset.CharacterCodingException
 import java.nio.charset.Charset
 import java.nio.charset.CodingErrorAction
 
 data class NovelSegment(val speaker: String, val isDialogue: Boolean, val text: String)
+
+/**
+ * 广播剧生成进度状态（断点续传）
+ */
+data class NovelBuildState(
+    val novelName: String,
+    val totalSegments: Int,
+    val completed: Int,
+    val segments: List<NovelSegment>,
+    val voiceMap: Map<String, String>
+)
+
+/**
+ * 断点续传：进度 JSON + PCM 临时文件，每段完成即落盘
+ */
+object NovelBuildManager {
+
+    private val gson = Gson()
+
+    fun dir(context: Context): File =
+        File(context.cacheDir, "novel").apply { mkdirs() }
+
+    fun pcmFile(context: Context): File = File(dir(context), "build.pcm")
+
+    private fun stateFile(context: Context): File = File(dir(context), "state.json")
+
+    fun save(context: Context, state: NovelBuildState) {
+        try {
+            stateFile(context).writeText(gson.toJson(state))
+        } catch (_: Exception) {
+        }
+    }
+
+    fun load(context: Context): NovelBuildState? = try {
+        val f = stateFile(context)
+        if (f.exists()) gson.fromJson(f.readText(), NovelBuildState::class.java) else null
+    } catch (_: Exception) {
+        null
+    }
+
+    fun clear(context: Context) {
+        stateFile(context).delete()
+        pcmFile(context).delete()
+    }
+}
 
 /**
  * 小说文本解析：启发式识别对白与角色（"XXX说道：'……'"模式）

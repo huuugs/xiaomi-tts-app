@@ -345,11 +345,25 @@ fun TtsScreen() {
     var novelProgress by remember { mutableStateOf("") }
     var isAnalyzing by remember { mutableStateOf(false) }
     var analyzeProgress by remember { mutableStateOf("") }
+    var resumeState by remember { mutableStateOf<NovelBuildState?>(null) }
 
     fun refreshHistory() {
         history = HistoryStore.list()
     }
-    LaunchedEffect(Unit) { refreshHistory() }
+    LaunchedEffect(Unit) {
+        refreshHistory()
+        // 恢复未完成的广播剧生成任务
+        val st = NovelBuildManager.load(context)
+        if (st != null && st.completed < st.totalSegments) {
+            resumeState = st
+            novelName = st.novelName
+            novelFullText = st.segments.joinToString("") { it.text }
+            novelSegments = st.segments
+            speakerVoices = st.voiceMap
+        } else if (st != null) {
+            NovelBuildManager.clear(context)
+        }
+    }
 
     fun playFile(file: File) {
         try {
@@ -554,6 +568,33 @@ fun TtsScreen() {
                         }
                     }
                 } else {
+                    // 恢复任务提示
+                    resumeState?.let { st ->
+                        Card(
+                            modifier = Modifier.fillMaxWidth(),
+                            colors = CardDefaults.cardColors(
+                                containerColor = MaterialTheme.colorScheme.tertiaryContainer
+                            )
+                        ) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 12.dp, vertical = 6.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    "📌 上次生成中断于第 ${st.completed}/${st.totalSegments} 段",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    modifier = Modifier.weight(1f)
+                                )
+                                TextButton(onClick = {
+                                    NovelBuildManager.clear(context)
+                                    resumeState = null
+                                }) { Text("放弃") }
+                            }
+                        }
+                    }
+
                     val sp = NovelParser.speakers(novelSegments)
                     val totalChars = novelSegments.sumOf { it.text.length }
                     Text(
@@ -665,40 +706,54 @@ fun TtsScreen() {
                             scope.launch {
                                 isNovelBuilding = true
                                 try {
-                                    // 流式落盘拼接：PCM 逐段追加写临时文件，大文件不驻留内存
-                                    val buildDir = File(context.cacheDir, "novel").apply { mkdirs() }
-                                    val pcmFile = File(buildDir, "build.pcm")
+                                    // 断点续传：从上次中断的段继续，PCM 追加写
+                                    val startIdx = resumeState?.completed ?: 0
+                                    val name = resumeState?.novelName ?: (novelName ?: "novel")
+                                    val pcmFile = NovelBuildManager.pcmFile(context)
+                                    val wavFile = File(NovelBuildManager.dir(context), "build.wav")
+
                                     withContext(Dispatchers.IO) {
-                                        pcmFile.outputStream().use { out ->
-                                            novelSegments.forEachIndexed { i, seg ->
+                                        FileOutputStream(pcmFile, startIdx > 0).use { out ->
+                                            for (i in startIdx until novelSegments.size) {
                                                 novelProgress = "${i + 1}/${novelSegments.size}"
-                                                val wav = XiaomiTtsClient(apiKey).synthesize(
+                                                val wav = XiaomiTtsClient(apiKey).synthesizeWithRetry(
                                                     TtsRequest(
                                                         model = "mimo-v2.5-tts",
-                                                        text = seg.text,
-                                                        voice = speakerVoices[seg.speaker] ?: "mimo_default"
+                                                        text = novelSegments[i].text,
+                                                        voice = speakerVoices[novelSegments[i].speaker]
+                                                            ?: "mimo_default"
                                                     )
                                                 )
                                                 out.write(AudioConverter.wavToPcm(wav))
+                                                // 每段完成即保存进度（断点续传）
+                                                NovelBuildManager.save(
+                                                    context,
+                                                    NovelBuildState(
+                                                        novelName = name,
+                                                        totalSegments = novelSegments.size,
+                                                        completed = i + 1,
+                                                        segments = novelSegments,
+                                                        voiceMap = speakerVoices
+                                                    )
+                                                )
                                             }
                                         }
-                                    }
-                                    val wavFile = File(buildDir, "build.wav")
-                                    withContext(Dispatchers.IO) {
                                         AudioConverter.pcmFileToWav(pcmFile, 24000, 1, wavFile)
                                     }
                                     pcmFile.delete()
                                     withContext(Dispatchers.IO) {
                                         val item = HistoryStore.addFile(
-                                            "mimo-v2.5-tts", "小说广播剧", novelName ?: "novel", wavFile
+                                            "mimo-v2.5-tts", "小说广播剧", name, wavFile
                                         )
                                         currentFile = item.file
                                     }
+                                    NovelBuildManager.clear(context)
+                                    resumeState = null
                                     refreshHistory()
                                     if (autoPlay) currentFile?.let { playFile(it) }
                                     Toast.makeText(context, "广播剧生成完成！", Toast.LENGTH_LONG).show()
                                 } catch (e: Exception) {
-                                    errorMsg = "广播剧生成失败（第 $novelProgress 段）\n\n${e.message}"
+                                    errorMsg = "广播剧生成失败（第 $novelProgress 段）\n\n${e.message}\n\n已保存进度，可点击「继续生成」从中断处继续"
                                 } finally {
                                     isNovelBuilding = false
                                 }
@@ -710,8 +765,11 @@ fun TtsScreen() {
                         Icon(Icons.Default.MenuBook, null)
                         Spacer(Modifier.width(8.dp))
                         Text(
-                            if (isNovelBuilding) "生成中 $novelProgress"
-                            else "生成广播剧（${novelSegments.size} 段）"
+                            when {
+                                isNovelBuilding -> "生成中 $novelProgress"
+                                resumeState != null -> "继续生成（从第 ${resumeState!!.completed + 1}/${resumeState!!.totalSegments} 段）"
+                                else -> "生成广播剧（${novelSegments.size} 段）"
+                            }
                         )
                     }
                 }
