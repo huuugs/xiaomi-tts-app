@@ -84,7 +84,7 @@ fun exportAudioToMusic(context: Context, data: ByteArray): String {
 }
 
 // ── 分组标签选择对话框（风格多选 / 音频标签插入） ──
-@OptIn(ExperimentalLayoutApi::class)
+@OptIn(ExperimentalLayoutApi::class, ExperimentalMaterial3Api::class)
 @Composable
 fun TagPickerDialog(
     title: String,
