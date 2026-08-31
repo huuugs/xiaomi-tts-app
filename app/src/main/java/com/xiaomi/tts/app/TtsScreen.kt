@@ -376,7 +376,8 @@ fun TtsScreen() {
                         label = { Text("音色描述（必填）") },
                         modifier = Modifier.fillMaxWidth(),
                         minLines = 2,
-                        placeholder = { Text("如：温柔的女声，语速慢，像深夜电台主播") }
+                        placeholder = { Text("如：温柔的女声，语速慢，像深夜电台主播") },
+                        supportingText = { Text("此模式下风格请用文本标签控制，如 (开心)") }
                     )
                     Row(
                         verticalAlignment = Alignment.CenterVertically,
@@ -463,11 +464,14 @@ fun TtsScreen() {
                     Spacer(Modifier.width(4.dp))
                     Text("文本模板")
                 }
-                OutlinedButton(
-                    onClick = { showNaturalStyle = !showNaturalStyle },
-                    modifier = Modifier.weight(1f)
-                ) {
-                    Text(if (showNaturalStyle) "▾ 自然语言风格" else "▸ 自然语言风格")
+                // 音色设计模式下 user 消息即音色描述，不支持独立自然语言风格
+                if (mode != 1) {
+                    OutlinedButton(
+                        onClick = { showNaturalStyle = !showNaturalStyle },
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Text(if (showNaturalStyle) "▾ 自然语言风格" else "▸ 自然语言风格")
+                    }
                 }
             }
 
