@@ -91,8 +91,19 @@ class XiaomiTtsClient(private val apiKey: String) {
         // ── 智能角色分析（LLM）──
 
         private const val LLM_MODEL = "mimo-v2.5-pro"
-        private const val LLM_MAX_CHARS = 10000
+        private const val LLM_MAX_CHARS = 4000
         private val llmGson = Gson()
+
+        /** 模型策略：优先极速模型/关思考，不支持则自动回退（400/404/422 触发） */
+        private data class LlmStrategy(val model: String, val disableThinking: Boolean)
+        private val llmStrategies = listOf(
+            LlmStrategy("mimo-v2.5-pro-ultraspeed", true),
+            LlmStrategy("mimo-v2.5-pro-ultraspeed", false),
+            LlmStrategy("mimo-v2.5-pro", true),
+            LlmStrategy("mimo-v2.5-pro", false)
+        )
+        @Volatile
+        private var llmStrategyIdx: Int? = null
 
         /**
          * 调 MiMo 文本模型推断每段说话者（Token Plan 套餐内用量）
