@@ -22,6 +22,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.History
@@ -300,10 +301,12 @@ fun TtsScreen() {
 
     // 小说模式
     var novelName by remember { mutableStateOf<String?>(null) }
+    var novelFullText by remember { mutableStateOf("") }
     var novelSegments by remember { mutableStateOf<List<NovelSegment>>(emptyList()) }
     var speakerVoices by remember { mutableStateOf<Map<String, String>>(emptyMap()) }
     var isNovelBuilding by remember { mutableStateOf(false) }
     var novelProgress by remember { mutableStateOf("") }
+    var isAnalyzing by remember { mutableStateOf(false) }
 
     fun refreshHistory() {
         history = HistoryStore.list()
@@ -417,6 +420,7 @@ fun TtsScreen() {
                     } ?: throw IOException("读取失败")
                     val content = NovelParser.decodeText(bytes)
                     novelName = uri.lastPathSegment?.substringAfterLast('/') ?: "novel.txt"
+                    novelFullText = content
                     val segs = NovelParser.parse(content)
                     novelSegments = segs
                     speakerVoices = NovelParser.defaultVoices(NovelParser.speakers(segs))
@@ -429,6 +433,7 @@ fun TtsScreen() {
                     ).show()
                 } catch (e: Exception) {
                     novelName = null
+                    novelFullText = ""
                     novelSegments = emptyList()
                     errorMsg = "小说导入失败\n\n${e.message}"
                 }
@@ -518,6 +523,55 @@ fun TtsScreen() {
                         style = MaterialTheme.typography.bodySmall
                     )
 
+                    // 智能分析（LLM 推断说话人，可选）
+                    if (isAnalyzing) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
+                            Spacer(Modifier.width(8.dp))
+                            Text("AI 分析中…（可能需要 30-60 秒）", style = MaterialTheme.typography.bodySmall)
+                        }
+                    } else {
+                        OutlinedButton(
+                            onClick = {
+                                if (apiKey.isBlank()) {
+                                    showKeyDialog = true
+                                    return@OutlinedButton
+                                }
+                                scope.launch {
+                                    isAnalyzing = true
+                                    try {
+                                        val truncated =
+                                            if (novelFullText.length > XiaomiTtsClient.llmMaxChars())
+                                                "（文本较长，仅分析前 ${XiaomiTtsClient.llmMaxChars()} 字）"
+                                            else ""
+                                        val segs = withContext(Dispatchers.IO) {
+                                            XiaomiTtsClient.llmAnalyze(apiKey, novelFullText)
+                                        }
+                                        if (segs.isEmpty()) throw IOException("AI 未返回有效分段")
+                                        novelSegments = segs
+                                        speakerVoices = NovelParser.defaultVoices(NovelParser.speakers(segs))
+                                        val newSp = NovelParser.speakers(segs)
+                                        Toast.makeText(
+                                            context,
+                                            "智能分析完成：${segs.size} 段，角色 ${newSp.size} 个$truncated",
+                                            Toast.LENGTH_LONG
+                                        ).show()
+                                    } catch (e: Exception) {
+                                        errorMsg = "智能分析失败\n\n${e.message}\n\n已保留规则解析结果"
+                                    } finally {
+                                        isAnalyzing = false
+                                    }
+                                }
+                            },
+                            modifier = Modifier.fillMaxWidth(),
+                            enabled = !isNovelBuilding
+                        ) {
+                            Icon(Icons.Default.AutoAwesome, null, Modifier.size(16.dp))
+                            Spacer(Modifier.width(8.dp))
+                            Text("智能分析（AI 推断说话人，更准）")
+                        }
+                    }
+
                     Text("角色配音", style = MaterialTheme.typography.titleSmall)
                     val voiceItems = XiaomiTtsClient.PRESET_VOICES
                     sp.forEach { (name, cnt) ->
@@ -601,7 +655,7 @@ fun TtsScreen() {
                             }
                         },
                         modifier = Modifier.fillMaxWidth(),
-                        enabled = !isNovelBuilding && novelSegments.isNotEmpty()
+                        enabled = !isNovelBuilding && !isAnalyzing && novelSegments.isNotEmpty()
                     ) {
                         Icon(Icons.Default.MenuBook, null)
                         Spacer(Modifier.width(8.dp))

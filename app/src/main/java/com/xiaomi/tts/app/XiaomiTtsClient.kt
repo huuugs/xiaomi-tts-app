@@ -4,6 +4,7 @@ import android.util.Base64
 import com.google.gson.Gson
 import com.google.gson.JsonObject
 import com.google.gson.JsonParser
+import com.google.gson.reflect.TypeToken
 import okhttp3.*
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.toRequestBody
@@ -86,6 +87,73 @@ class XiaomiTtsClient(private val apiKey: String) {
             }
             return dataUri
         }
+
+        // ── 智能角色分析（LLM）──
+
+        private const val LLM_MODEL = "mimo-v2.5-pro"
+        private const val LLM_MAX_CHARS = 10000
+        private val llmGson = Gson()
+
+        /**
+         * 调 MiMo 文本模型推断每段说话者（Token Plan 套餐内用量）
+         * 超长文本仅分析前 10000 字
+         */
+        fun llmAnalyze(apiKey: String, text: String): List<NovelSegment> {
+            val limited = if (text.length > LLM_MAX_CHARS) text.take(LLM_MAX_CHARS) else text
+            val system = "你是小说剧本分析助手。把用户给的小说文本切分为朗读分段并标注说话者。\n" +
+                    "规则：\n" +
+                    "1. 旁白与对白分开成段，保持原文顺序，不改动、不删减文本内容\n" +
+                    "2. 对白的 speaker 填角色名：优先用「XX说」提示语，无提示语时根据上下文对话逻辑推断\n" +
+                    "3. 旁白的 speaker 固定填 旁白\n" +
+                    "4. 同一角色名前后保持一致；完全无法判断的对白 speaker 填 未标注\n" +
+                    "5. 超过 300 字的长段按句号切分\n" +
+                    "输出纯 JSON 数组（不要 markdown 代码块、不要任何解释文字）：\n" +
+                    "[{\"speaker\":\"旁白\",\"isDialogue\":false,\"text\":\"……\"},{\"speaker\":\"角色名\",\"isDialogue\":true,\"text\":\"……\"}]"
+
+            val requestBody = JsonObject().apply {
+                addProperty("model", LLM_MODEL)
+                add("messages", gson.toJsonTree(listOf(
+                    mapOf("role" to "system", "content" to system),
+                    mapOf("role" to "user", "content" to limited)
+                )))
+                addProperty("temperature", 0.1)
+            }
+
+            val request = Request.Builder()
+                .url("$API_BASE_URL/chat/completions")
+                .addHeader("Authorization", "Bearer $apiKey")
+                .addHeader("Content-Type", "application/json")
+                .post(requestBody.toString().toRequestBody("application/json".toMediaType()))
+                .build()
+
+            OkHttpClient.Builder()
+                .connectTimeout(30, TimeUnit.SECONDS)
+                .readTimeout(300, TimeUnit.SECONDS)
+                .build().newCall(request).execute().use { response ->
+                    if (!response.isSuccessful) {
+                        val err = try { response.body?.string() ?: "" } catch (_: Exception) { "" }
+                        throw IOException("智能分析 API ${response.code}: ${err.take(300)}")
+                    }
+                    val body = response.body?.string() ?: throw IOException("响应为空")
+                    val content = JsonParser.parseString(body).asJsonObject
+                        .getAsJsonArray("choices")[0].asJsonObject
+                        .getAsJsonObject("message").get("content").asString
+
+                    // 剥离可能的 markdown 围栏/多余文字，提取最外层 JSON 数组
+                    val start = content.indexOf('[')
+                    val end = content.lastIndexOf(']')
+                    if (start < 0 || end <= start) {
+                        throw IOException("模型未返回有效分段：${content.take(200)}")
+                    }
+                    val json = content.substring(start, end + 1)
+
+                    val type = object : TypeToken<List<NovelSegment>>() {}.type
+                    val segs: List<NovelSegment> = llmGson.fromJson(json, type) ?: emptyList()
+                    return segs.filter { it.text.isNotBlank() }
+                }
+        }
+
+        fun llmMaxChars(): Int = LLM_MAX_CHARS
 
         /**
          * 魔数检测真实音频格式（不信任扩展名/MIME）
