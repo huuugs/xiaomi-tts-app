@@ -124,8 +124,8 @@ class XiaomiTtsClient(private val apiKey: String) {
             apiKey: String,
             chunk: String,
             knownSpeakers: Set<String>,
-            onDelta: (Int) -> Unit = {},
-            retries: Int = 3
+            retries: Int = 3,
+            onDelta: (Int) -> Unit = {}
         ): List<NovelSegment> {
             var lastError: IOException? = null
             for (attempt in 0..retries) {
