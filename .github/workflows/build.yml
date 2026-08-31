@@ -8,6 +8,9 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      # secrets 不能直接用于 steps.if，经 job env 中转
+      HAS_KEYSTORE: ${{ secrets.KEYSTORE_BASE64 != '' }}
 
     steps:
       - name: Checkout code
@@ -23,7 +26,7 @@ jobs:
         uses: gradle/actions/setup-gradle@v3
 
       - name: Decode keystore
-        if: ${{ secrets.KEYSTORE_BASE64 != '' }}
+        if: env.HAS_KEYSTORE == 'true'
         env:
           KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
         run: |
@@ -34,26 +37,26 @@ jobs:
         run: chmod +x gradlew
 
       - name: Build Release APK (fixed signing)
-        if: ${{ secrets.KEYSTORE_BASE64 != '' }}
+        if: env.HAS_KEYSTORE == 'true'
         env:
           KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: ./gradlew assembleRelease -PversionCode=${{ github.run_number }}
 
-      - name: Build Debug APK (fallback, unsigned release unavailable)
-        if: ${{ secrets.KEYSTORE_BASE64 == '' }}
+      - name: Build Debug APK (fallback)
+        if: env.HAS_KEYSTORE != 'true'
         run: ./gradlew assembleDebug -PversionCode=${{ github.run_number }}
 
       - name: Upload Release APK artifact
-        if: ${{ secrets.KEYSTORE_BASE64 != '' }}
+        if: env.HAS_KEYSTORE == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: xiaomi-tts-app
           path: app/build/outputs/apk/release/app-release.apk
 
       - name: Upload Debug APK artifact
-        if: ${{ secrets.KEYSTORE_BASE64 == '' }}
+        if: env.HAS_KEYSTORE != 'true'
         uses: actions/upload-artifact@v4
         with:
           name: xiaomi-tts-app
