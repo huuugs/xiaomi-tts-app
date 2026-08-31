@@ -58,9 +58,9 @@ object NovelParser {
             for (ch in s.text) {
                 sb.append(ch)
                 count++
-                if (count >= 400 && ch in "。！？!?…") {
+                if (count >= 400 && ch in "。！？！?…") {
                     out += s.copy(text = sb.toString())
-                    sb = StringBuilder()
+                    sb.setLength(0)
                     count = 0
                 }
             }
