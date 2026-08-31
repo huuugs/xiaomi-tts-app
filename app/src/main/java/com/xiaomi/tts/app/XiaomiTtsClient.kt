@@ -98,76 +98,87 @@ class XiaomiTtsClient(private val apiKey: String) {
          * 调 MiMo 文本模型推断每段说话者（Token Plan 套餐内用量）
          * 任意长度：超过单块上限自动分块，块间传递已知角色名单保持命名一致
          */
+        /**
+         * 智能角色分析（优化版）：本地规则切分（秒出），LLM 只标注每段说话人。
+         * 输出仅为角色名数组，速度快数十倍。
+         */
         fun llmAnalyze(
             apiKey: String,
             text: String,
             onProgress: (chunkIndex: Int, chunkTotal: Int, receivedChars: Int) -> Unit = { _, _, _ -> }
         ): List<NovelSegment> {
-            val chunks = if (text.length <= LLM_MAX_CHARS) listOf(text)
-            else text.chunked(LLM_MAX_CHARS)
-            val result = mutableListOf<NovelSegment>()
-            val knownSpeakers = linkedSetOf<String>()
+            val segments = NovelParser.parse(text)
+            if (segments.isEmpty()) return segments
 
-            chunks.forEachIndexed { i, chunk ->
-                val segs = analyzeChunkWithRetry(apiKey, chunk, knownSpeakers) { chars ->
-                    onProgress(i + 1, chunks.size, chars)
+            // 按累计字数分块（每块约 1 万字）
+            val chunks = mutableListOf<MutableList<Int>>()
+            var cur = mutableListOf<Int>()
+            var acc = 0
+            segments.forEachIndexed { i, seg ->
+                if (acc + seg.text.length > LLM_MAX_CHARS && cur.isNotEmpty()) {
+                    chunks += cur
+                    cur = mutableListOf()
+                    acc = 0
                 }
-                result += segs
-                segs.filter { it.isDialogue && it.speaker != "未标注" }
-                    .forEach { knownSpeakers.add(it.speaker) }
+                cur += i
+                acc += seg.text.length
             }
-            return result
+            if (cur.isNotEmpty()) chunks += cur
+
+            val speakers = arrayOfNulls<String>(segments.size)
+            val known = linkedSetOf<String>()
+
+            chunks.forEachIndexed { ci, idxs ->
+                onProgress(ci + 1, chunks.size, 0)
+                val labels = labelChunkWithRetry(apiKey, segments, idxs, known) { chars ->
+                    onProgress(ci + 1, chunks.size, chars)
+                }
+                idxs.forEachIndexed { j, segIdx ->
+                    speakers[segIdx] = labels.getOrNull(j) ?: "未标注"
+                }
+                known += labels.filter { it != "旁白" && it != "未标注" && it.isNotBlank() }
+            }
+
+            return segments.mapIndexed { i, seg ->
+                seg.copy(speaker = speakers[i] ?: "未标注")
+            }
         }
 
-        /** 带重试的单块分析（网络中断自动退避重试） */
-        private fun analyzeChunkWithRetry(
+        /**
+         * 请求 LLM 标注一块分段的说话人，返回与 idxs 等长的角色名列表
+         */
+        private fun labelChunk(
             apiKey: String,
-            chunk: String,
-            knownSpeakers: Set<String>,
-            retries: Int = 3,
-            onDelta: (Int) -> Unit = {}
-        ): List<NovelSegment> {
-            var lastError: IOException? = null
-            for (attempt in 0..retries) {
-                try {
-                    return analyzeChunk(apiKey, chunk, knownSpeakers, onDelta)
-                } catch (e: IOException) {
-                    lastError = e
-                    if (attempt < retries) {
-                        try {
-                            Thread.sleep((attempt + 1) * 4000L)
-                        } catch (_: InterruptedException) {
-                        }
-                    }
-                }
-            }
-            throw lastError ?: IOException("未知错误")
-        }
-
-        private fun analyzeChunk(
-            apiKey: String,
-            chunk: String,
+            segments: List<NovelSegment>,
+            idxs: List<Int>,
             knownSpeakers: Set<String>,
             onDelta: (Int) -> Unit = {}
-        ): List<NovelSegment> {
-            val system = "你是小说剧本分析助手。把用户给的小说文本切分为朗读分段并标注说话者。\n" +
-                    "规则：\n" +
-                    "1. 旁白与对白分开成段，保持原文顺序，不改动、不删减文本内容\n" +
-                    "2. 对白的 speaker 填角色名：优先用「XX说」提示语，无提示语时根据上下文对话逻辑推断\n" +
-                    "3. 旁白的 speaker 固定填 旁白\n" +
-                    "4. 同一角色名前后保持一致；完全无法判断的对白 speaker 填 未标注\n" +
-                    "5. 超过 300 字的长段按句号切分\n" +
+        ): List<String> {
+            val system = "你是小说对白说话人标注助手。输入是分段数组（i=序号，d=1对白/0旁白，t=文本可能截断）。\n" +
+                    "推断每段说话人并只输出 JSON 字符串数组：\n" +
+                    "- d=0 的段输出 \"旁白\"\n" +
+                    "- d=1 的段输出角色名：优先用文本前的「XX说」提示；无提示时按上下文对话逻辑推断（注意对话轮替，同一角色说话风格一致）\n" +
+                    "- 完全无法判断输出 \"未标注\"\n" +
                     (if (knownSpeakers.isNotEmpty())
-                        "已知角色（命名务必保持一致）：${knownSpeakers.joinToString("、")}\n"
+                        "- 已知角色（命名保持一致）：${knownSpeakers.joinToString("、")}\n"
                     else "") +
-                    "输出纯 JSON 数组（不要 markdown 代码块、不要任何解释文字）：\n" +
-                    "[{\"speaker\":\"旁白\",\"isDialogue\":false,\"text\":\"……\"},{\"speaker\":\"角色名\",\"isDialogue\":true,\"text\":\"……\"}]"
+                    "输出数组长度必须等于输入分段数量，不要输出任何其他内容。\n" +
+                    "示例输出：[\"旁白\",\"林清雪\",\"陈默\"]"
+
+            // 输入压缩：旁白截 20 字（输出固定），对白截 120 字（推断足够）
+            val input = idxs.map { i ->
+                mapOf(
+                    "i" to i,
+                    "d" to if (segments[i].isDialogue) 1 else 0,
+                    "t" to segments[i].text.take(if (segments[i].isDialogue) 120 else 20)
+                )
+            }
 
             val requestBody = JsonObject().apply {
                 addProperty("model", LLM_MODEL)
                 add("messages", llmGson.toJsonTree(listOf(
                     mapOf("role" to "system", "content" to system),
-                    mapOf("role" to "user", "content" to chunk)
+                    mapOf("role" to "user", "content" to llmGson.toJson(input))
                 )))
                 addProperty("temperature", 0.1)
                 addProperty("stream", true)
@@ -189,7 +200,6 @@ class XiaomiTtsClient(private val apiKey: String) {
                         throw IOException("智能分析 API ${response.code}: ${err.take(300)}")
                     }
 
-                    // 流式接收：实时反馈已输出字符数
                     val sb = StringBuilder()
                     var lastCb = 0
                     response.body?.source()?.use { source ->
@@ -205,7 +215,7 @@ class XiaomiTtsClient(private val apiKey: String) {
                                 val delta = choices[0].asJsonObject.getAsJsonObject("delta") ?: continue
                                 if (delta.has("content") && !delta.get("content").isJsonNull) {
                                     sb.append(delta.get("content").asString)
-                                    if (sb.length - lastCb >= 100) {
+                                    if (sb.length - lastCb >= 30) {
                                         lastCb = sb.length
                                         onDelta(sb.length)
                                     }
@@ -220,14 +230,45 @@ class XiaomiTtsClient(private val apiKey: String) {
                     val start = content.indexOf('[')
                     val end = content.lastIndexOf(']')
                     if (start < 0 || end <= start) {
-                        throw IOException("模型未返回有效分段：${content.take(200)}")
+                        throw IOException("模型未返回有效标注：${content.take(200)}")
                     }
-                    val json = content.substring(start, end + 1)
-
-                    val type = object : TypeToken<List<NovelSegment>>() {}.type
-                    val segs: List<NovelSegment> = llmGson.fromJson(json, type) ?: emptyList()
-                    return segs.filter { it.text.isNotBlank() }
+                    val arr = JsonParser.parseString(content.substring(start, end + 1)).asJsonArray
+                    val labels = mutableListOf<String>()
+                    for (e in arr) {
+                        val s = if (e.isJsonNull) "" else e.asString.trim()
+                        labels.add(s.ifBlank { "未标注" })
+                    }
+                    if (labels.size != idxs.size) {
+                        throw IOException("标注数量不符（${labels.size}/${idxs.size}），请重试")
+                    }
+                    return labels
                 }
+        }
+
+        /** 带重试的标注（网络中断自动退避重试） */
+        private fun labelChunkWithRetry(
+            apiKey: String,
+            segments: List<NovelSegment>,
+            idxs: List<Int>,
+            knownSpeakers: Set<String>,
+            retries: Int = 3,
+            onDelta: (Int) -> Unit = {}
+        ): List<String> {
+            var lastError: IOException? = null
+            for (attempt in 0..retries) {
+                try {
+                    return labelChunk(apiKey, segments, idxs, knownSpeakers, onDelta)
+                } catch (e: IOException) {
+                    lastError = e
+                    if (attempt < retries) {
+                        try {
+                            Thread.sleep((attempt + 1) * 4000L)
+                        } catch (_: InterruptedException) {
+                        }
+                    }
+                }
+            }
+            throw lastError ?: IOException("未知错误")
         }
 
         fun llmMaxChars(): Int = LLM_MAX_CHARS
