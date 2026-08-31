@@ -124,10 +124,8 @@ class XiaomiTtsClient(private val apiKey: String) {
     /**
      * 文本转语音（非流式，返回 WAV 音频）
      */
-    fun synthesize(req: TtsRequest): ByteArray {
+    private fun buildMessages(req: TtsRequest): MutableList<JsonObject> {
         val messages = mutableListOf<JsonObject>()
-
-        // user 消息：voicedesign 时为音色描述（必填）；其他模式为可选风格指令；voiceclone 可为空串
         val userContent = when (req.model) {
             "mimo-v2.5-tts-voicedesign" -> req.style ?: throw IOException("音色设计模式需要填写音色描述")
             "mimo-v2.5-tts-voiceclone" -> req.style ?: ""
@@ -139,16 +137,17 @@ class XiaomiTtsClient(private val apiKey: String) {
                 addProperty("content", userContent)
             })
         }
-
-        // assistant 消息：目标文本（TTS 模型必需）
         messages.add(JsonObject().apply {
             addProperty("role", "assistant")
             addProperty("content", req.text)
         })
+        return messages
+    }
 
+    fun synthesize(req: TtsRequest): ByteArray {
         val requestBody = JsonObject().apply {
             addProperty("model", req.model)
-            add("messages", gson.toJsonTree(messages))
+            add("messages", gson.toJsonTree(buildMessages(req)))
             addProperty("stream", false)
             add("modalities", gson.toJsonTree(listOf("text", "audio")))
             add("audio", JsonObject().apply {
@@ -188,5 +187,71 @@ class XiaomiTtsClient(private val apiKey: String) {
 
         val audio = message.getAsJsonObject("audio")
         return Base64.decode(audio.get("data").asString, Base64.DEFAULT)
+    }
+
+    /**
+     * 流式文本转语音：逐块回调 PCM16（24kHz mono），边收边播
+     * 返回完整 PCM 数据（供保存为 WAV）
+     * 注意：仅 mimo-v2.5-tts 支持低延迟流式；其余模型为兼容模式（末尾一次返回）
+     */
+    fun synthesizeStream(req: TtsRequest, onChunk: (ByteArray) -> Unit): ByteArray {
+        val requestBody = JsonObject().apply {
+            addProperty("model", req.model)
+            add("messages", gson.toJsonTree(buildMessages(req)))
+            addProperty("stream", true)
+            add("modalities", gson.toJsonTree(listOf("text", "audio")))
+            add("audio", JsonObject().apply {
+                addProperty("format", "pcm16")
+                if (req.voice != null) addProperty("voice", req.voice)
+            })
+        }
+
+        val request = Request.Builder()
+            .url("$API_BASE_URL/chat/completions")
+            .addHeader("Authorization", "Bearer $apiKey")
+            .addHeader("Content-Type", "application/json")
+            .post(requestBody.toString().toRequestBody("application/json".toMediaType()))
+            .build()
+
+        val response = client.newCall(request).execute()
+
+        if (!response.isSuccessful) {
+            throw parseError(response)
+        }
+
+        val chunks = mutableListOf<ByteArray>()
+        response.body?.source()?.use { source ->
+            while (!source.exhausted()) {
+                val line = source.readUtf8Line() ?: break
+                if (!line.startsWith("data: ")) continue
+                val dataStr = line.substring(6)
+                if (dataStr.trim() == "[DONE]") break
+                try {
+                    val chunk = JsonParser.parseString(dataStr).asJsonObject
+                    val choices = chunk.getAsJsonArray("choices") ?: continue
+                    if (choices.size() == 0) continue
+                    val delta = choices[0].asJsonObject.getAsJsonObject("delta") ?: continue
+                    if (!delta.has("audio") || delta.get("audio").isJsonNull) continue
+                    val audio = delta.getAsJsonObject("audio")
+                    if (!audio.has("data") || audio.get("data").isJsonNull) continue
+                    val decoded = Base64.decode(audio.get("data").asString, Base64.DEFAULT)
+                    if (decoded.isNotEmpty()) {
+                        chunks.add(decoded)
+                        onChunk(decoded)
+                    }
+                } catch (e: Exception) {
+                    continue
+                }
+            }
+        }
+
+        val total = chunks.sumOf { it.size }
+        val result = ByteArray(total)
+        var offset = 0
+        for (c in chunks) {
+            System.arraycopy(c, 0, result, offset, c.size)
+            offset += c.size
+        }
+        return result
     }
 }

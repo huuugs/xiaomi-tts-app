@@ -7,6 +7,8 @@ import android.content.ContentValues
 import android.content.Context
 import android.content.pm.PackageManager
 import android.media.AudioAttributes
+import android.media.AudioFormat
+import android.media.AudioTrack
 import android.media.MediaPlayer
 import android.os.Build
 import android.os.Environment
@@ -20,18 +22,19 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.ArrowDropDown
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.Label
 import androidx.compose.material.icons.filled.LibraryMusic
+import androidx.compose.material.icons.filled.MenuBook
 import androidx.compose.material.icons.filled.MusicNote
 import androidx.compose.material.icons.filled.Notes
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Save
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Stop
+import androidx.compose.material.icons.filled.UploadFile
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -83,7 +86,52 @@ fun exportAudioToMusic(context: Context, data: ByteArray): String {
     }
 }
 
-// ── 分组标签选择对话框（风格多选 / 音频标签插入） ──
+/**
+ * PCM 流式播放器（API 流式输出为 24kHz mono PCM16）
+ */
+class AudioStreamPlayer {
+    private var track: AudioTrack? = null
+
+    fun start() {
+        stop()
+        val minBuf = AudioTrack.getMinBufferSize(
+            24000, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT
+        )
+        track = AudioTrack.Builder()
+            .setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .build()
+            )
+            .setAudioFormat(
+                AudioFormat.Builder()
+                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                    .setSampleRate(24000)
+                    .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                    .build()
+            )
+            .setBufferSizeInBytes(maxOf(minBuf, 24000 * 2))
+            .setTransferMode(AudioTrack.MODE_STREAM)
+            .build()
+        track?.play()
+    }
+
+    fun write(pcm: ByteArray) {
+        track?.write(pcm, 0, pcm.size)
+    }
+
+    fun stop() {
+        try {
+            track?.stop()
+            track?.release()
+        } catch (_: Exception) {
+        }
+        track = null
+    }
+}
+
+// ── 分组标签选择对话框 ──
 @OptIn(ExperimentalLayoutApi::class, ExperimentalMaterial3Api::class)
 @Composable
 fun TagPickerDialog(
@@ -149,7 +197,7 @@ fun TagPickerDialog(
     )
 }
 
-// ── 列表选择下拉框 ──
+// ── 下拉选择器 ──
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun <T> DropdownSelector(
@@ -157,7 +205,8 @@ fun <T> DropdownSelector(
     items: List<T>,
     itemLabel: (T) -> String,
     selected: T,
-    onSelect: (T) -> Unit
+    onSelect: (T) -> Unit,
+    modifier: Modifier = Modifier
 ) {
     var expanded by remember { mutableStateOf(false) }
     ExposedDropdownMenuBox(
@@ -170,8 +219,7 @@ fun <T> DropdownSelector(
             readOnly = true,
             label = { Text(label) },
             trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded) },
-            modifier = Modifier
-                .fillMaxWidth()
+            modifier = modifier
                 .menuAnchor()
         )
         ExposedDropdownMenu(
@@ -197,8 +245,11 @@ fun TtsScreen() {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
 
+    // ── 设置（持久化）──
     val prefs = remember { context.getSharedPreferences("tts_settings", Context.MODE_PRIVATE) }
     var apiKey by remember { mutableStateOf(prefs.getString("api_key", "") ?: "") }
+    var autoPlay by remember { mutableStateOf(prefs.getBoolean("auto_play", true)) }
+    var streamMode by remember { mutableStateOf(prefs.getBoolean("stream_mode", false)) }
     var showKeyDialog by remember { mutableStateOf(false) }
     fun saveApiKey(key: String) {
         apiKey = key
@@ -207,10 +258,14 @@ fun TtsScreen() {
 
     var errorMsg by remember { mutableStateOf<String?>(null) }
 
-    // 模式
+    // 模式：0 预置音色 / 1 音色设计 / 2 音色克隆 / 3 小说模式
     var mode by remember { mutableIntStateOf(0) }
-    val modes = listOf("预置音色", "音色设计", "音色克隆")
-    val modelIds = listOf("mimo-v2.5-tts", "mimo-v2.5-tts-voicedesign", "mimo-v2.5-tts-voiceclone")
+    val modes = listOf("预置音色", "音色设计", "音色克隆", "小说模式")
+    val modelIds = listOf(
+        "mimo-v2.5-tts",
+        "mimo-v2.5-tts-voicedesign",
+        "mimo-v2.5-tts-voiceclone"
+    )
 
     // 模式状态
     var selectedVoice by remember { mutableStateOf("mimo_default") }
@@ -227,7 +282,7 @@ fun TtsScreen() {
     var naturalStyle by remember { mutableStateOf("") }
     var showNaturalStyle by remember { mutableStateOf(false) }
 
-    // 对话框开关
+    // 对话框
     var showStyleDialog by remember { mutableStateOf(false) }
     var showAudioTagDialog by remember { mutableStateOf(false) }
     var showTemplateDialog by remember { mutableStateOf(false) }
@@ -240,7 +295,15 @@ fun TtsScreen() {
     var audioData by remember { mutableStateOf<ByteArray?>(null) }
     var currentFile by remember { mutableStateOf<File?>(null) }
     var mediaPlayer by remember { mutableStateOf<MediaPlayer?>(null) }
+    var streamPlayer by remember { mutableStateOf(AudioStreamPlayer()) }
     var history by remember { mutableStateOf(emptyList<HistoryItem>()) }
+
+    // 小说模式
+    var novelName by remember { mutableStateOf<String?>(null) }
+    var novelSegments by remember { mutableStateOf<List<NovelSegment>>(emptyList()) }
+    var speakerVoices by remember { mutableStateOf<Map<String, String>>(emptyMap()) }
+    var isNovelBuilding by remember { mutableStateOf(false) }
+    var novelProgress by remember { mutableStateOf("") }
 
     fun refreshHistory() {
         history = HistoryStore.list()
@@ -249,6 +312,7 @@ fun TtsScreen() {
 
     fun playFile(file: File) {
         try {
+            streamPlayer.stop()
             mediaPlayer?.release()
             mediaPlayer = MediaPlayer().apply {
                 setAudioAttributes(
@@ -265,6 +329,21 @@ fun TtsScreen() {
             isPlaying = true
         } catch (e: Exception) {
             errorMsg = "播放失败: ${e.message}"
+        }
+    }
+
+    // 合成完成后的统一处理：保存历史 + 按设置决定是否自动播放
+    fun finishResult(wav: ByteArray, modelId: String, modeName: String, text: String) {
+        audioData = wav
+        scope.launch {
+            withContext(Dispatchers.IO) {
+                val item = HistoryStore.add(modelId, modeName, text, wav)
+                currentFile = item.file
+            }
+            refreshHistory()
+            if (autoPlay) {
+                currentFile?.let { playFile(it) }
+            }
         }
     }
 
@@ -290,7 +369,7 @@ fun TtsScreen() {
         else Toast.makeText(context, "未授予存储权限，无法导出", Toast.LENGTH_SHORT).show()
     }
 
-    // 选择克隆音频：mp3/wav 直接用，其他自动转码
+    // 选择克隆音频
     val pickAudio = rememberLauncherForActivityResult(
         ActivityResultContracts.OpenDocument()
     ) { uri ->
@@ -326,8 +405,42 @@ fun TtsScreen() {
         }
     }
 
+    // 导入 TXT 小说
+    val pickTxt = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri != null) {
+            scope.launch {
+                try {
+                    val bytes = withContext(Dispatchers.IO) {
+                        context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
+                    } ?: throw IOException("读取失败")
+                    val content = NovelParser.decodeText(bytes)
+                    novelName = uri.lastPathSegment?.substringAfterLast('/') ?: "novel.txt"
+                    val segs = NovelParser.parse(content)
+                    novelSegments = segs
+                    speakerVoices = NovelParser.defaultVoices(NovelParser.speakers(segs))
+                    val sp = NovelParser.speakers(segs)
+                    val dialogueCount = segs.count { it.isDialogue }
+                    Toast.makeText(
+                        context,
+                        "已解析 ${segs.size} 段（对白 $dialogueCount），角色 ${sp.size} 个",
+                        Toast.LENGTH_LONG
+                    ).show()
+                } catch (e: Exception) {
+                    novelName = null
+                    novelSegments = emptyList()
+                    errorMsg = "小说导入失败\n\n${e.message}"
+                }
+            }
+        }
+    }
+
     DisposableEffect(Unit) {
-        onDispose { mediaPlayer?.release() }
+        onDispose {
+            mediaPlayer?.release()
+            streamPlayer.stop()
+        }
     }
 
     Scaffold(
@@ -351,242 +464,392 @@ fun TtsScreen() {
             verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
             // ── 模式 Tab ──
-            TabRow(selectedTabIndex = mode) {
+            ScrollableTabRow(selectedTabIndex = mode, edgePadding = 0.dp) {
                 modes.forEachIndexed { i, title ->
-                    Tab(selected = mode == i, onClick = { mode = i }, text = { Text(title) })
+                    Tab(
+                        selected = mode == i,
+                        onClick = { mode = i },
+                        text = { Text(title, maxLines = 1) }
+                    )
                 }
             }
 
-            // ── 模式配置（紧凑，下拉/单行）──
-            when (mode) {
-                0 -> {
-                    val voiceItems = XiaomiTtsClient.PRESET_VOICES
-                    DropdownSelector(
-                        label = "音色",
-                        items = voiceItems,
-                        itemLabel = { it.second },
-                        selected = voiceItems.first { it.first == selectedVoice },
-                        onSelect = { selectedVoice = it.first }
+            if (mode == 3) {
+                // ════════ 小说模式 ════════
+                OutlinedButton(
+                    onClick = { pickTxt.launch(arrayOf("text/plain", "application/txt", "text/*")) },
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Icon(Icons.Default.UploadFile, null)
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        if (novelName == null) "导入 TXT 小说（自动识别角色）"
+                        else "$novelName · 点击更换"
                     )
                 }
-                1 -> {
-                    OutlinedTextField(
-                        value = voiceDesignPrompt,
-                        onValueChange = { voiceDesignPrompt = it },
-                        label = { Text("音色描述（必填）") },
+
+                if (novelName == null) {
+                    Card(
                         modifier = Modifier.fillMaxWidth(),
-                        minLines = 2,
-                        placeholder = { Text("如：温柔的女声，语速慢，像深夜电台主播") },
-                        supportingText = { Text("此模式下风格请用文本标签控制，如 (开心)") }
-                    )
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        colors = CardDefaults.cardColors(
+                            containerColor = MaterialTheme.colorScheme.surfaceVariant
+                        )
                     ) {
-                        TextButton(onClick = { showTemplateDialog = true }) {
-                            Icon(Icons.Default.Notes, null, Modifier.size(16.dp))
-                            Text(" 描述模板")
-                        }
-                        Spacer(Modifier.weight(1f))
-                        Switch(checked = optimizePreview, onCheckedChange = { optimizePreview = it })
-                        Text("润色", style = MaterialTheme.typography.bodySmall)
-                    }
-                }
-                2 -> {
-                    OutlinedButton(
-                        onClick = {
-                            pickAudio.launch(
-                                arrayOf(
-                                    "audio/mpeg", "audio/mp3", "audio/wav", "audio/x-wav",
-                                    "audio/mp4", "audio/aac", "audio/ogg", "audio/*"
-                                )
+                        Column(
+                            modifier = Modifier.padding(14.dp),
+                            verticalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            Icon(Icons.Default.MenuBook, null)
+                            Text("自动生成广播剧", style = MaterialTheme.typography.titleSmall)
+                            Text(
+                                "1. 导入 TXT（自动识别 UTF-8 / GBK 编码）\n" +
+                                        "2. 自动解析对白与旁白，识别「XX说：『…』」中的角色\n" +
+                                        "3. 为每个角色分配预置音色\n" +
+                                        "4. 逐段合成，拼接为完整音频",
+                                style = MaterialTheme.typography.bodySmall
                             )
+                        }
+                    }
+                } else {
+                    val sp = NovelParser.speakers(novelSegments)
+                    val totalChars = novelSegments.sumOf { it.text.length }
+                    Text(
+                        "${novelSegments.size} 段 · $totalChars 字 · ${sp.size} 个角色",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+
+                    Text("角色配音", style = MaterialTheme.typography.titleSmall)
+                    val voiceItems = XiaomiTtsClient.PRESET_VOICES
+                    sp.forEach { (name, cnt) ->
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Text(
+                                if (name == "旁白") "旁白" else name,
+                                style = MaterialTheme.typography.bodyMedium,
+                                modifier = Modifier.width(72.dp),
+                                maxLines = 1
+                            )
+                            Text(
+                                "$cnt 段",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.width(38.dp)
+                            )
+                            DropdownSelector(
+                                label = "音色",
+                                items = voiceItems,
+                                itemLabel = { it.second },
+                                selected = voiceItems.first { it.first == (speakerVoices[name] ?: "mimo_default") },
+                                onSelect = { speakerVoices = speakerVoices + (name to it.first) },
+                                modifier = Modifier.weight(1f)
+                            )
+                        }
+                    }
+
+                    if (isNovelBuilding) {
+                        val progressVal = novelProgress.split("/").let {
+                            if (it.size == 2)
+                                (it[0].toFloatOrNull() ?: 0f) / (it[1].toFloatOrNull() ?: 1f)
+                            else 0f
+                        }
+                        LinearProgressIndicator(
+                            progress = progressVal,
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                        Text("正在合成第 $novelProgress 段…", style = MaterialTheme.typography.bodySmall)
+                    }
+
+                    Button(
+                        onClick = {
+                            if (apiKey.isBlank()) {
+                                showKeyDialog = true
+                                return@Button
+                            }
+                            scope.launch {
+                                isNovelBuilding = true
+                                try {
+                                    val parts = mutableListOf<ByteArray>()
+                                    novelSegments.forEachIndexed { i, seg ->
+                                        novelProgress = "${i + 1}/${novelSegments.size}"
+                                        val wav = withContext(Dispatchers.IO) {
+                                            XiaomiTtsClient(apiKey).synthesize(
+                                                TtsRequest(
+                                                    model = "mimo-v2.5-tts",
+                                                    text = seg.text,
+                                                    voice = speakerVoices[seg.speaker] ?: "mimo_default"
+                                                )
+                                            )
+                                        }
+                                        parts += AudioConverter.wavToPcm(wav)
+                                    }
+                                    val pcm = ByteArray(parts.sumOf { it.size })
+                                    var off = 0
+                                    parts.forEach {
+                                        System.arraycopy(it, 0, pcm, off, it.size)
+                                        off += it.size
+                                    }
+                                    val wav = AudioConverter.pcmToWav(pcm, 24000, 1)
+                                    finishResult(wav, "mimo-v2.5-tts", "小说广播剧", novelName ?: "novel")
+                                    Toast.makeText(context, "广播剧生成完成！", Toast.LENGTH_LONG).show()
+                                } catch (e: Exception) {
+                                    errorMsg = "广播剧生成失败（第 $novelProgress 段）\n\n${e.message}"
+                                } finally {
+                                    isNovelBuilding = false
+                                }
+                            }
                         },
                         modifier = Modifier.fillMaxWidth(),
-                        enabled = !isConverting
+                        enabled = !isNovelBuilding && novelSegments.isNotEmpty()
                     ) {
-                        if (isConverting) {
-                            CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
-                            Spacer(Modifier.width(8.dp))
-                            Text("转换中…")
-                        } else {
-                            Icon(Icons.Default.MusicNote, null)
-                            Spacer(Modifier.width(8.dp))
-                            Text(if (cloneBytes == null) "选择音频样本（自动支持常见格式）" else "$cloneInfo · 更换")
-                        }
-                    }
-                }
-            }
-
-            // ── 文本输入（首屏核心区）──
-            OutlinedTextField(
-                value = textFieldValue,
-                onValueChange = { textFieldValue = it },
-                label = { Text("要合成的文本") },
-                modifier = Modifier.fillMaxWidth(),
-                minLines = 4,
-                maxLines = 10,
-                trailingIcon = {
-                    if (textFieldValue.text.isNotEmpty()) {
-                        IconButton(onClick = { textFieldValue = TextFieldValue("") }) {
-                            Icon(Icons.Default.Close, contentDescription = "清空")
-                        }
-                    }
-                },
-                supportingText = {
-                    val n = textFieldValue.text.length
-                    Text(
-                        buildString {
-                            append("$n 字")
-                            if (selectedTags.isNotEmpty()) append(" ｜ 风格: ${selectedTags.joinToString(" ")}")
-                            if (n > 500) append(" ｜ 长文本耗时较久")
-                        }
-                    )
-                }
-            )
-
-            // ── 工具行：风格 / 音频标签 / 模板 / 自然语言 ──
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedButton(onClick = { showStyleDialog = true }, modifier = Modifier.weight(1f)) {
-                    Icon(Icons.Default.Label, null, Modifier.size(16.dp))
-                    Spacer(Modifier.width(4.dp))
-                    Text(if (selectedTags.isEmpty()) "风格" else "风格 ${selectedTags.size}")
-                }
-                OutlinedButton(onClick = { showAudioTagDialog = true }, modifier = Modifier.weight(1f)) {
-                    Icon(Icons.Default.LibraryMusic, null, Modifier.size(16.dp))
-                    Spacer(Modifier.width(4.dp))
-                    Text("音频标签")
-                }
-            }
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedButton(onClick = { showTemplateDialog = true }, modifier = Modifier.weight(1f)) {
-                    Icon(Icons.Default.Notes, null, Modifier.size(16.dp))
-                    Spacer(Modifier.width(4.dp))
-                    Text("文本模板")
-                }
-                // 音色设计模式下 user 消息即音色描述，不支持独立自然语言风格
-                if (mode != 1) {
-                    OutlinedButton(
-                        onClick = { showNaturalStyle = !showNaturalStyle },
-                        modifier = Modifier.weight(1f)
-                    ) {
-                        Text(if (showNaturalStyle) "▾ 自然语言风格" else "▸ 自然语言风格")
-                    }
-                }
-            }
-
-            // 已选风格标签（可单个移除）
-            if (selectedTags.isNotEmpty()) {
-                FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    selectedTags.forEach { tag ->
-                        InputChip(
-                            selected = true,
-                            onClick = { selectedTags = selectedTags - tag },
-                            label = { Text(tag, style = MaterialTheme.typography.labelMedium) },
-                            trailingIcon = {
-                                Icon(
-                                    Icons.Default.Close, "移除",
-                                    Modifier.size(14.dp)
-                                )
-                            }
+                        Icon(Icons.Default.MenuBook, null)
+                        Spacer(Modifier.width(8.dp))
+                        Text(
+                            if (isNovelBuilding) "生成中 $novelProgress"
+                            else "生成广播剧（${novelSegments.size} 段）"
                         )
                     }
                 }
-            }
-
-            // 自然语言风格（折叠）
-            if (showNaturalStyle && mode != 1) {
-                OutlinedTextField(
-                    value = naturalStyle,
-                    onValueChange = { naturalStyle = it },
-                    label = { Text("自然语言风格 / 导演模式") },
-                    modifier = Modifier.fillMaxWidth(),
-                    minLines = 2,
-                    placeholder = { Text("如：用轻快上扬的语调说，语速稍快") }
-                )
-            }
-
-            // ── 合成按钮 ──
-            Button(
-                onClick = {
-                    if (apiKey.isBlank()) {
-                        showKeyDialog = true
-                        return@Button
-                    }
-                    val text = textFieldValue.text
-                    when {
-                        text.isBlank() -> {
-                            Toast.makeText(context, "请输入要合成的文本", Toast.LENGTH_SHORT).show()
-                            return@Button
-                        }
-                        mode == 1 && voiceDesignPrompt.isBlank() -> {
-                            Toast.makeText(context, "音色设计模式需要填写音色描述", Toast.LENGTH_SHORT).show()
-                            return@Button
-                        }
-                        mode == 2 && cloneBytes == null -> {
-                            Toast.makeText(context, "请先选择音频样本", Toast.LENGTH_SHORT).show()
-                            return@Button
+            } else {
+                // ════════ 普通模式 0-2 ════════
+                when (mode) {
+                    0 -> {
+                        val voiceItems = XiaomiTtsClient.PRESET_VOICES
+                        DropdownSelector(
+                            label = "音色",
+                            items = voiceItems,
+                            itemLabel = { it.second },
+                            selected = voiceItems.first { it.first == selectedVoice },
+                            onSelect = { selectedVoice = it.first }
+                        )
+                        if (streamMode) {
+                            Text(
+                                "✓ 流式播放已开启：边合成边播放",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.primary
+                            )
                         }
                     }
-
-                    val finalText = if (selectedTags.isEmpty()) text
-                    else "(${selectedTags.joinToString(" ")})$text"
-                    val voice = when (mode) {
-                        0 -> selectedVoice
-                        2 -> XiaomiTtsClient.buildCloneVoice(cloneMime, cloneBytes!!)
-                        else -> null
+                    1 -> {
+                        OutlinedTextField(
+                            value = voiceDesignPrompt,
+                            onValueChange = { voiceDesignPrompt = it },
+                            label = { Text("音色描述（必填）") },
+                            modifier = Modifier.fillMaxWidth(),
+                            minLines = 2,
+                            placeholder = { Text("如：温柔的女声，语速慢，像深夜电台主播") },
+                            supportingText = { Text("此模式下风格请用文本标签控制，如 (开心)") }
+                        )
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            TextButton(onClick = { showTemplateDialog = true }) {
+                                Icon(Icons.Default.Notes, null, Modifier.size(16.dp))
+                                Text(" 描述模板")
+                            }
+                            Spacer(Modifier.weight(1f))
+                            Switch(checked = optimizePreview, onCheckedChange = { optimizePreview = it })
+                            Text("润色", style = MaterialTheme.typography.bodySmall)
+                        }
                     }
-                    val style = when (mode) {
-                        1 -> voiceDesignPrompt
-                        else -> naturalStyle.ifBlank { null }
-                    }
-
-                    scope.launch {
-                        isLoading = true
-                        try {
-                            val result = withContext(Dispatchers.IO) {
-                                XiaomiTtsClient(apiKey).synthesize(
-                                    TtsRequest(
-                                        model = modelIds[mode],
-                                        text = finalText,
-                                        style = style,
-                                        voice = voice,
-                                        optimizeTextPreview = optimizePreview && mode == 1
+                    2 -> {
+                        OutlinedButton(
+                            onClick = {
+                                pickAudio.launch(
+                                    arrayOf(
+                                        "audio/mpeg", "audio/mp3", "audio/wav", "audio/x-wav",
+                                        "audio/mp4", "audio/aac", "audio/ogg", "audio/*"
                                     )
                                 )
+                            },
+                            modifier = Modifier.fillMaxWidth(),
+                            enabled = !isConverting
+                        ) {
+                            if (isConverting) {
+                                CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
+                                Spacer(Modifier.width(8.dp))
+                                Text("转换中…")
+                            } else {
+                                Icon(Icons.Default.MusicNote, null)
+                                Spacer(Modifier.width(8.dp))
+                                Text(if (cloneBytes == null) "选择音频样本（自动支持常见格式）" else "$cloneInfo · 更换")
                             }
-                            audioData = result
-                            withContext(Dispatchers.IO) {
-                                val item = HistoryStore.add(modelIds[mode], modes[mode], finalText, result)
-                                currentFile = item.file
-                            }
-                            refreshHistory()
-                            currentFile?.let { playFile(it) }
-                        } catch (e: Exception) {
-                            errorMsg = "合成失败\n\n${e.message}"
-                        } finally {
-                            isLoading = false
                         }
                     }
-                },
-                modifier = Modifier.fillMaxWidth(),
-                enabled = !isLoading && !(mode == 2 && isConverting) && textFieldValue.text.isNotBlank()
-            ) {
-                if (isLoading) {
-                    CircularProgressIndicator(
-                        Modifier.size(20.dp), strokeWidth = 2.dp,
-                        color = MaterialTheme.colorScheme.onPrimary
+                }
+
+                // 文本输入
+                OutlinedTextField(
+                    value = textFieldValue,
+                    onValueChange = { textFieldValue = it },
+                    label = { Text("要合成的文本") },
+                    modifier = Modifier.fillMaxWidth(),
+                    minLines = 4,
+                    maxLines = 10,
+                    trailingIcon = {
+                        if (textFieldValue.text.isNotEmpty()) {
+                            IconButton(onClick = { textFieldValue = TextFieldValue("") }) {
+                                Icon(Icons.Default.Close, contentDescription = "清空")
+                            }
+                        }
+                    },
+                    supportingText = {
+                        val n = textFieldValue.text.length
+                        Text(
+                            buildString {
+                                append("$n 字")
+                                if (selectedTags.isNotEmpty()) append(" ｜ 风格: ${selectedTags.joinToString(" ")}")
+                                if (n > 500) append(" ｜ 长文本耗时较久")
+                            }
+                        )
+                    }
+                )
+
+                // 工具行
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedButton(onClick = { showStyleDialog = true }, modifier = Modifier.weight(1f)) {
+                        Icon(Icons.Default.Label, null, Modifier.size(16.dp))
+                        Spacer(Modifier.width(4.dp))
+                        Text(if (selectedTags.isEmpty()) "风格" else "风格 ${selectedTags.size}")
+                    }
+                    OutlinedButton(onClick = { showAudioTagDialog = true }, modifier = Modifier.weight(1f)) {
+                        Icon(Icons.Default.LibraryMusic, null, Modifier.size(16.dp))
+                        Spacer(Modifier.width(4.dp))
+                        Text("音频标签")
+                    }
+                }
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedButton(onClick = { showTemplateDialog = true }, modifier = Modifier.weight(1f)) {
+                        Icon(Icons.Default.Notes, null, Modifier.size(16.dp))
+                        Spacer(Modifier.width(4.dp))
+                        Text("文本模板")
+                    }
+                    if (mode != 1) {
+                        OutlinedButton(
+                            onClick = { showNaturalStyle = !showNaturalStyle },
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text(if (showNaturalStyle) "▾ 自然语言风格" else "▸ 自然语言风格")
+                        }
+                    }
+                }
+
+                // 已选风格标签
+                if (selectedTags.isNotEmpty()) {
+                    FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        selectedTags.forEach { tag ->
+                            InputChip(
+                                selected = true,
+                                onClick = { selectedTags = selectedTags - tag },
+                                label = { Text(tag, style = MaterialTheme.typography.labelMedium) },
+                                trailingIcon = { Icon(Icons.Default.Close, "移除", Modifier.size(14.dp)) }
+                            )
+                        }
+                    }
+                }
+
+                // 自然语言风格
+                if (showNaturalStyle && mode != 1) {
+                    OutlinedTextField(
+                        value = naturalStyle,
+                        onValueChange = { naturalStyle = it },
+                        label = { Text("自然语言风格 / 导演模式") },
+                        modifier = Modifier.fillMaxWidth(),
+                        minLines = 2,
+                        placeholder = { Text("如：用轻快上扬的语调说，语速稍快") }
                     )
-                    Spacer(Modifier.width(8.dp))
-                    Text("合成中…（长文本可能 1-2 分钟）")
-                } else {
-                    Icon(Icons.Default.PlayArrow, null)
-                    Spacer(Modifier.width(8.dp))
-                    Text("开始合成")
+                }
+
+                // 合成按钮
+                Button(
+                    onClick = {
+                        if (apiKey.isBlank()) {
+                            showKeyDialog = true
+                            return@Button
+                        }
+                        val text = textFieldValue.text
+                        when {
+                            text.isBlank() -> {
+                                Toast.makeText(context, "请输入要合成的文本", Toast.LENGTH_SHORT).show()
+                                return@Button
+                            }
+                            mode == 1 && voiceDesignPrompt.isBlank() -> {
+                                Toast.makeText(context, "音色设计模式需要填写音色描述", Toast.LENGTH_SHORT).show()
+                                return@Button
+                            }
+                            mode == 2 && cloneBytes == null -> {
+                                Toast.makeText(context, "请先选择音频样本", Toast.LENGTH_SHORT).show()
+                                return@Button
+                            }
+                        }
+
+                        val finalText = if (selectedTags.isEmpty()) text
+                        else "(${selectedTags.joinToString(" ")})$text"
+                        val voice = when (mode) {
+                            0 -> selectedVoice
+                            2 -> XiaomiTtsClient.buildCloneVoice(cloneMime, cloneBytes!!)
+                            else -> null
+                        }
+                        val style = when (mode) {
+                            1 -> voiceDesignPrompt
+                            else -> naturalStyle.ifBlank { null }
+                        }
+                        val req = TtsRequest(
+                            model = modelIds[mode],
+                            text = finalText,
+                            style = style,
+                            voice = voice,
+                            optimizeTextPreview = optimizePreview && mode == 1
+                        )
+
+                        scope.launch {
+                            isLoading = true
+                            try {
+                                if (mode == 0 && streamMode) {
+                                    // 流式：边收边播
+                                    streamPlayer.start()
+                                    val pcm = withContext(Dispatchers.IO) {
+                                        XiaomiTtsClient(apiKey).synthesizeStream(req) { chunk ->
+                                            streamPlayer.write(chunk)
+                                        }
+                                    }
+                                    val wav = AudioConverter.pcmToWav(pcm, 24000, 1)
+                                    finishResult(wav, modelIds[0], modes[0], finalText)
+                                } else {
+                                    val result = withContext(Dispatchers.IO) {
+                                        XiaomiTtsClient(apiKey).synthesize(req)
+                                    }
+                                    finishResult(result, modelIds[mode], modes[mode], finalText)
+                                }
+                            } catch (e: Exception) {
+                                streamPlayer.stop()
+                                errorMsg = "合成失败\n\n${e.message}"
+                            } finally {
+                                isLoading = false
+                            }
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                    enabled = !isLoading && !(mode == 2 && isConverting) && textFieldValue.text.isNotBlank()
+                ) {
+                    if (isLoading) {
+                        CircularProgressIndicator(
+                            Modifier.size(20.dp), strokeWidth = 2.dp,
+                            color = MaterialTheme.colorScheme.onPrimary
+                        )
+                        Spacer(Modifier.width(8.dp))
+                        Text(if (streamMode && mode == 0) "流式合成播放中…" else "合成中…")
+                    } else {
+                        Icon(Icons.Default.PlayArrow, null)
+                        Spacer(Modifier.width(8.dp))
+                        Text("开始合成")
+                    }
                 }
             }
 
-            // ── 结果操作 ──
+            // ── 结果操作（共用）──
             if (audioData != null) {
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Button(
@@ -623,7 +886,7 @@ fun TtsScreen() {
                 }
             }
 
-            // ── 历史（默认折叠）──
+            // ── 历史 ──
             if (history.isNotEmpty()) {
                 TextButton(onClick = { showHistory = !showHistory }, modifier = Modifier.fillMaxWidth()) {
                     Icon(Icons.Default.History, null, Modifier.size(16.dp))
@@ -686,7 +949,7 @@ fun TtsScreen() {
         }
     }
 
-    // ── 风格标签对话框（多选）──
+    // ── 风格标签对话框 ──
     if (showStyleDialog) {
         TagPickerDialog(
             title = "风格标签（可多选）",
@@ -698,7 +961,7 @@ fun TtsScreen() {
         )
     }
 
-    // ── 音频标签对话框（点击插入光标处）──
+    // ── 音频标签对话框 ──
     if (showAudioTagDialog) {
         TagPickerDialog(
             title = "音频标签（插入到光标处）",
@@ -715,7 +978,7 @@ fun TtsScreen() {
         )
     }
 
-    // ── 模板对话框（点击填入）──
+    // ── 模板对话框 ──
     if (showTemplateDialog) {
         AlertDialog(
             onDismissRequest = { showTemplateDialog = false },
@@ -729,7 +992,7 @@ fun TtsScreen() {
                 ) {
                     val templates = if (mode == 1) XiaomiTtsClient.VOICE_DESIGN_TEMPLATES
                     else XiaomiTtsClient.TEXT_TEMPLATES
-                    templates.forEachIndexed { i, t ->
+                    templates.forEach { t ->
                         OutlinedCard(
                             modifier = Modifier
                                 .fillMaxWidth()
@@ -755,13 +1018,13 @@ fun TtsScreen() {
         )
     }
 
-    // ── API Key 对话框 ──
+    // ── 设置对话框（API Key + 偏好）──
     if (showKeyDialog) {
         AlertDialog(
             onDismissRequest = { showKeyDialog = false },
-            title = { Text("设置 API Key") },
+            title = { Text("设置") },
             text = {
-                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                     OutlinedTextField(
                         value = apiKey,
                         onValueChange = { saveApiKey(it) },
@@ -769,7 +1032,40 @@ fun TtsScreen() {
                         visualTransformation = PasswordVisualTransformation(),
                         modifier = Modifier.fillMaxWidth()
                     )
-                    Text("保存于本机。从小米 MiMo 开放平台获取。", style = MaterialTheme.typography.bodySmall)
+                    Text(
+                        "保存于本机。从小米 MiMo 开放平台获取。",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Column(Modifier.weight(1f)) {
+                            Text("合成后自动播放", style = MaterialTheme.typography.bodyMedium)
+                        }
+                        Switch(
+                            checked = autoPlay,
+                            onCheckedChange = {
+                                autoPlay = it
+                                prefs.edit().putBoolean("auto_play", it).apply()
+                            }
+                        )
+                    }
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Column(Modifier.weight(1f)) {
+                            Text("流式播放", style = MaterialTheme.typography.bodyMedium)
+                            Text(
+                                "仅预置音色模式：边合成边播放",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        Switch(
+                            checked = streamMode,
+                            onCheckedChange = {
+                                streamMode = it
+                                prefs.edit().putBoolean("stream_mode", it).apply()
+                            }
+                        )
+                    }
                 }
             },
             confirmButton = {
@@ -778,7 +1074,7 @@ fun TtsScreen() {
         )
     }
 
-    // ── 错误详情对话框 ──
+    // ── 错误对话框 ──
     errorMsg?.let { msg ->
         AlertDialog(
             onDismissRequest = { errorMsg = null },

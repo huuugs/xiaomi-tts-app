@@ -115,6 +115,28 @@ object AudioConverter {
     }
 
     /**
+     * 从 WAV 提取 PCM 数据（定位 data chunk，兼容非 44 字节头）
+     */
+    fun wavToPcm(wav: ByteArray): ByteArray {
+        if (wav.size < 12) return wav
+        var pos = 12
+        while (pos + 8 <= wav.size) {
+            val id = String(wav, pos, 4, Charsets.US_ASCII)
+            val size = (wav[pos + 4].toInt() and 0xFF) or
+                    ((wav[pos + 5].toInt() and 0xFF) shl 8) or
+                    ((wav[pos + 6].toInt() and 0xFF) shl 16) or
+                    ((wav[pos + 7].toInt() and 0xFF) shl 24)
+            if (id == "data") {
+                val end = minOf(pos + 8 + size, wav.size)
+                return wav.copyOfRange(pos + 8, end)
+            }
+            pos += 8 + size + (size and 1)
+        }
+        // 兜底：剥标准 44 字节头
+        return wav.copyOfRange(44.coerceAtMost(wav.size), wav.size)
+    }
+
+    /**
      * PCM16 封装 WAV 头（小端）
      */
     fun pcmToWav(pcm: ByteArray, sampleRate: Int, channels: Int): ByteArray {
