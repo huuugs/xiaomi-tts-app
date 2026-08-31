@@ -640,9 +640,9 @@ fun TtsScreen() {
                                     analyzeDetail = ""
                                     try {
                                         val segs = withContext(Dispatchers.IO) {
-                                            XiaomiTtsClient.llmAnalyze(apiKey, novelFullText) { cur, total, chars ->
+                                            XiaomiTtsClient.llmAnalyze(apiKey, novelFullText) { cur, total, isOutput, chars ->
                                                 analyzeProgress = "$cur / $total 块"
-                                                analyzeDetail = "已接收 $chars 字"
+                                                analyzeDetail = (if (isOutput) "输出中 " else "思考中 ") + "$chars 字"
                                             }
                                         }
                                         if (segs.isEmpty()) throw IOException("AI 未返回有效分段")

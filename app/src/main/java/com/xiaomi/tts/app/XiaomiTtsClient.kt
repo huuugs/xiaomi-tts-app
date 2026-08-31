@@ -116,7 +116,7 @@ class XiaomiTtsClient(private val apiKey: String) {
         fun llmAnalyze(
             apiKey: String,
             text: String,
-            onProgress: (chunkIndex: Int, chunkTotal: Int, receivedChars: Int) -> Unit = { _, _, _ -> }
+            onProgress: (chunkIndex: Int, chunkTotal: Int, isOutput: Boolean, chars: Int) -> Unit = { _, _, _, _ -> }
         ): List<NovelSegment> {
             val segments = NovelParser.parse(text)
             if (segments.isEmpty()) return segments
@@ -140,9 +140,9 @@ class XiaomiTtsClient(private val apiKey: String) {
             val known = linkedSetOf<String>()
 
             chunks.forEachIndexed { ci, idxs ->
-                onProgress(ci + 1, chunks.size, 0)
-                val labels = labelWithStrategies(apiKey, segments, idxs, known) { chars ->
-                    onProgress(ci + 1, chunks.size, chars)
+                onProgress(ci + 1, chunks.size, true, 0)
+                val labels = labelWithStrategies(apiKey, segments, idxs, known) { isOutput, chars ->
+                    onProgress(ci + 1, chunks.size, isOutput, chars)
                 }
                 idxs.forEachIndexed { j, segIdx ->
                     speakers[segIdx] = labels.getOrNull(j) ?: "未标注"
@@ -164,7 +164,7 @@ class XiaomiTtsClient(private val apiKey: String) {
             idxs: List<Int>,
             knownSpeakers: Set<String>,
             strategyIdx: Int,
-            onDelta: (Int) -> Unit = {}
+            onDelta: (Boolean, Int) -> Unit = { _, _ -> }
         ): List<String> {
             val strategy = llmStrategies[strategyIdx]
             val system = "任务：为小说分段标注说话人。这是模式匹配任务，直接给出答案，不需要推理过程、不要解释。\n" +
@@ -225,7 +225,9 @@ class XiaomiTtsClient(private val apiKey: String) {
                         throw IOException("智能分析 API ${response.code}: ${err.take(300)}")
                     }
 
-                    val sb = StringBuilder()
+                    // 流式接收：思考(reasoning_content)与输出(content)分别计数，实时反馈
+                    val outSb = StringBuilder()
+                    val thinkSb = StringBuilder()
                     var lastCb = 0
                     response.body?.source()?.use { source ->
                         while (!source.exhausted()) {
@@ -238,12 +240,19 @@ class XiaomiTtsClient(private val apiKey: String) {
                                 val choices = obj.getAsJsonArray("choices") ?: continue
                                 if (choices.size() == 0) continue
                                 val delta = choices[0].asJsonObject.getAsJsonObject("delta") ?: continue
+                                var changed = false
+                                if (delta.has("reasoning_content") && !delta.get("reasoning_content").isJsonNull) {
+                                    thinkSb.append(delta.get("reasoning_content").asString)
+                                    changed = true
+                                }
                                 if (delta.has("content") && !delta.get("content").isJsonNull) {
-                                    sb.append(delta.get("content").asString)
-                                    if (sb.length - lastCb >= 30) {
-                                        lastCb = sb.length
-                                        onDelta(sb.length)
-                                    }
+                                    outSb.append(delta.get("content").asString)
+                                    changed = true
+                                }
+                                val total = outSb.length + thinkSb.length
+                                if (changed && total - lastCb >= 30) {
+                                    lastCb = total
+                                    onDelta(outSb.isNotEmpty(), total)
                                 }
                             } catch (_: Exception) {
                                 continue
@@ -251,7 +260,7 @@ class XiaomiTtsClient(private val apiKey: String) {
                         }
                     }
 
-                    val content = sb.toString()
+                    val content = outSb.toString()
                     val start = content.indexOf('[')
                     val end = content.lastIndexOf(']')
                     if (start < 0 || end <= start) {
@@ -278,7 +287,7 @@ class XiaomiTtsClient(private val apiKey: String) {
             segments: List<NovelSegment>,
             idxs: List<Int>,
             knownSpeakers: Set<String>,
-            onDelta: (Int) -> Unit = {}
+            onDelta: (Boolean, Int) -> Unit = { _, _ -> }
         ): List<String> {
             val cached = llmStrategyIdx
             val order = if (cached != null)
@@ -310,7 +319,7 @@ class XiaomiTtsClient(private val apiKey: String) {
             idxs: List<Int>,
             knownSpeakers: Set<String>,
             strategyIdx: Int,
-            onDelta: (Int) -> Unit = {}
+            onDelta: (Boolean, Int) -> Unit = { _, _ -> }
         ): List<String> {
             var lastError: IOException? = null
             for (attempt in 0..3) {
