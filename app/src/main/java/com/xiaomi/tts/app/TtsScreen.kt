@@ -113,6 +113,7 @@ fun TtsScreen() {
     var cloneBytes by remember { mutableStateOf<ByteArray?>(null) }
     var cloneInfo by remember { mutableStateOf("") }
     var cloneMime by remember { mutableStateOf("") }
+    var isConverting by remember { mutableStateOf(false) }
 
     // 文本与标签
     var textFieldValue by remember { mutableStateOf(TextFieldValue("")) }
@@ -177,35 +178,48 @@ fun TtsScreen() {
         else Toast.makeText(context, "未授予存储权限，无法导出", Toast.LENGTH_SHORT).show()
     }
 
-    // 选择克隆音频样本（魔数检测真实格式）
+    // 选择克隆音频样本：mp3/wav 直接用，其他格式自动转码为 WAV
     val pickAudio = rememberLauncherForActivityResult(
         ActivityResultContracts.OpenDocument()
     ) { uri ->
         if (uri != null) {
-            try {
-                val bytes = context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
-                if (bytes == null || bytes.isEmpty()) {
-                    Toast.makeText(context, "读取音频失败", Toast.LENGTH_SHORT).show()
-                } else {
-                    val mime = XiaomiTtsClient.detectAudioMime(bytes)
-                    if (mime == null) {
-                        cloneBytes = null
-                        cloneInfo = ""
-                        showError(
-                            "所选文件不是有效的 MP3/WAV 音频（魔数检测失败）。\n" +
-                                    "常见原因：文件实际是 aac/m4a/amr/ogg 等格式，仅改了扩展名。\n" +
-                                    "请用格式转换工具转为 mp3 或 wav 后重试。"
-                        )
-                    } else {
-                        val fmt = if (mime == "audio/wav") "WAV" else "MP3"
-                        cloneBytes = bytes
-                        cloneMime = mime
-                        cloneInfo = "$fmt · ${bytes.size / 1024} KB"
-                        Toast.makeText(context, "已识别 $fmt 音频（${bytes.size / 1024} KB）", Toast.LENGTH_SHORT).show()
+            scope.launch {
+                isConverting = true
+                try {
+                    val (bytes, mime, fmtName) = withContext(Dispatchers.IO) {
+                        val raw = context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
+                            ?: throw IOException("读取音频失败")
+                        if (raw.isEmpty()) throw IOException("文件为空")
+                        val m = XiaomiTtsClient.detectAudioMime(raw)
+                        if (m != null) {
+                            Triple(raw, m, if (m == "audio/wav") "WAV" else "MP3")
+                        } else {
+                            // 非 mp3/wav：离线自动转码（m4a/aac/ogg/amr/flac/视频音轨等）
+                            val wav = AudioConverter.decodeToWav(context, uri)
+                            Triple(wav, "audio/wav", "WAV·已转换")
+                        }
                     }
+                    // 提前校验 base64 后大小（≤10MB），避免合成时才报错
+                    XiaomiTtsClient.buildCloneVoice(mime, bytes)
+                    cloneBytes = bytes
+                    cloneMime = mime
+                    cloneInfo = "$fmtName · ${bytes.size / 1024} KB"
+                    Toast.makeText(
+                        context,
+                        "音频已就绪（$fmtName ${bytes.size / 1024} KB）",
+                        Toast.LENGTH_SHORT
+                    ).show()
+                } catch (e: Exception) {
+                    cloneBytes = null
+                    cloneInfo = ""
+                    showError(
+                        "音频处理失败\n\n${e.message}\n\n" +
+                                "支持：MP3 / WAV 直接使用；" +
+                                "M4A / AAC / OGG / AMR / FLAC / 视频音轨自动转为 WAV。"
+                    )
+                } finally {
+                    isConverting = false
                 }
-            } catch (e: Exception) {
-                Toast.makeText(context, "读取失败: ${e.message}", Toast.LENGTH_SHORT).show()
             }
         }
     }
@@ -293,20 +307,36 @@ fun TtsScreen() {
                                 )
                             )
                         },
-                        modifier = Modifier.fillMaxWidth()
+                        modifier = Modifier.fillMaxWidth(),
+                        enabled = !isConverting
                     ) {
-                        Icon(Icons.Default.MusicNote, contentDescription = null)
-                        Spacer(Modifier.width(8.dp))
-                        Text(
-                            if (cloneBytes == null) "选择音频样本（mp3/wav）"
-                            else "$cloneInfo · 点击更换"
-                        )
+                        if (isConverting) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(18.dp),
+                                strokeWidth = 2.dp
+                            )
+                            Spacer(Modifier.width(8.dp))
+                            Text("转换中…（解码并封装 WAV）")
+                        } else {
+                            Icon(Icons.Default.MusicNote, contentDescription = null)
+                            Spacer(Modifier.width(8.dp))
+                            Text(
+                                if (cloneBytes == null) "选择音频样本（自动支持常见格式）"
+                                else "$cloneInfo · 点击更换"
+                            )
+                        }
                     }
                     if (cloneBytes != null) {
                         Text(
                             "已就绪：$cloneInfo（base64 后需 ≤10MB）",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.primary
+                        )
+                    } else {
+                        Text(
+                            "支持 MP3/WAV 直接使用；M4A/AAC/OGG/AMR/FLAC/视频音轨自动转 WAV",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
                     }
                 }
@@ -509,7 +539,7 @@ fun TtsScreen() {
                     }
                 },
                 modifier = Modifier.fillMaxWidth(),
-                enabled = !isLoading && textFieldValue.text.isNotBlank()
+                enabled = !isLoading && !(mode == 2 && isConverting) && textFieldValue.text.isNotBlank()
             ) {
                 if (isLoading) {
                     CircularProgressIndicator(
