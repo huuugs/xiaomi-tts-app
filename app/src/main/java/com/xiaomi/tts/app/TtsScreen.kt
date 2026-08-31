@@ -1,6 +1,8 @@
 package com.xiaomi.tts.app
 
 import android.Manifest
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.ContentValues
 import android.content.Context
 import android.content.pm.PackageManager
@@ -19,8 +21,10 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.History
+import androidx.compose.material.icons.filled.MusicNote
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Save
 import androidx.compose.material.icons.filled.Settings
@@ -30,9 +34,9 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.TextFieldValue
-import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.Dispatchers
@@ -76,19 +80,7 @@ fun exportAudioToMusic(context: Context, data: ByteArray): String {
     }
 }
 
-/** 根据 Uri/MIME 判断克隆音频的合法 MIME（API 仅支持 mp3/wav） */
-fun resolveCloneMime(context: Context, uri: android.net.Uri, displayName: String): String? {
-    val mime = context.contentResolver.getType(uri)?.lowercase() ?: ""
-    return when {
-        mime in listOf("audio/mpeg", "audio/mp3") -> "audio/mpeg"
-        mime in listOf("audio/wav", "audio/x-wav", "audio/wave") -> "audio/wav"
-        displayName.endsWith(".mp3", true) -> "audio/mpeg"
-        displayName.endsWith(".wav", true) -> "audio/wav"
-        else -> null
-    }
-}
-
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
 fun TtsScreen() {
     val context = LocalContext.current
@@ -102,6 +94,12 @@ fun TtsScreen() {
         prefs.edit().putString("api_key", key).apply()
     }
 
+    // 错误详情对话框
+    var errorMsg by remember { mutableStateOf<String?>(null) }
+    fun showError(msg: String) {
+        errorMsg = msg
+    }
+
     // 模式：0 预置音色 / 1 音色设计 / 2 音色克隆
     var mode by remember { mutableIntStateOf(0) }
     val modes = listOf("预置音色", "音色设计", "音色克隆")
@@ -112,7 +110,7 @@ fun TtsScreen() {
     var voiceDesignPrompt by remember { mutableStateOf("") }
     var optimizePreview by remember { mutableStateOf(false) }
     var cloneBytes by remember { mutableStateOf<ByteArray?>(null) }
-    var cloneName by remember { mutableStateOf("") }
+    var cloneInfo by remember { mutableStateOf("") }
     var cloneMime by remember { mutableStateOf("") }
 
     // 文本与标签
@@ -126,17 +124,16 @@ fun TtsScreen() {
     var isPlaying by remember { mutableStateOf(false) }
     var isExporting by remember { mutableStateOf(false) }
     var audioData by remember { mutableStateOf<ByteArray?>(null) }
-    var currentFile by remember { mutableStateOf<java.io.File?>(null) }
+    var currentFile by remember { mutableStateOf<File?>(null) }
     var mediaPlayer by remember { mutableStateOf<MediaPlayer?>(null) }
     var history by remember { mutableStateOf(emptyList<HistoryItem>()) }
 
-    // 刷新历史
     fun refreshHistory() {
         history = HistoryStore.list()
     }
     LaunchedEffect(Unit) { refreshHistory() }
 
-    fun playFile(file: java.io.File) {
+    fun playFile(file: File) {
         try {
             mediaPlayer?.release()
             mediaPlayer = MediaPlayer().apply {
@@ -153,7 +150,7 @@ fun TtsScreen() {
             }
             isPlaying = true
         } catch (e: Exception) {
-            Toast.makeText(context, "播放失败: ${e.message}", Toast.LENGTH_SHORT).show()
+            showError("播放失败: ${e.message}")
         }
     }
 
@@ -165,7 +162,7 @@ fun TtsScreen() {
                 val path = withContext(Dispatchers.IO) { exportAudioToMusic(context, data) }
                 Toast.makeText(context, "已导出: $path", Toast.LENGTH_LONG).show()
             } catch (e: Exception) {
-                Toast.makeText(context, "导出失败: ${e.message}", Toast.LENGTH_LONG).show()
+                showError("导出失败: ${e.message}")
             } finally {
                 isExporting = false
             }
@@ -179,29 +176,31 @@ fun TtsScreen() {
         else Toast.makeText(context, "未授予存储权限，无法导出", Toast.LENGTH_SHORT).show()
     }
 
-    // 选择克隆音频样本
+    // 选择克隆音频样本（魔数检测真实格式）
     val pickAudio = rememberLauncherForActivityResult(
         ActivityResultContracts.OpenDocument()
     ) { uri ->
         if (uri != null) {
             try {
-                val name = uri.lastPathSegment?.substringAfterLast('/') ?: "audio"
-                val mime = resolveCloneMime(context, uri, name)
-                if (mime == null) {
-                    Toast.makeText(context, "仅支持 mp3 / wav 格式", Toast.LENGTH_SHORT).show()
+                val bytes = context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
+                if (bytes == null || bytes.isEmpty()) {
+                    Toast.makeText(context, "读取音频失败", Toast.LENGTH_SHORT).show()
                 } else {
-                    val bytes = context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
-                    if (bytes == null || bytes.isEmpty()) {
-                        Toast.makeText(context, "读取音频失败", Toast.LENGTH_SHORT).show()
+                    val mime = XiaomiTtsClient.detectAudioMime(bytes)
+                    if (mime == null) {
+                        cloneBytes = null
+                        cloneInfo = ""
+                        showError(
+                            "所选文件不是有效的 MP3/WAV 音频（魔数检测失败）。\n" +
+                                    "常见原因：文件实际是 aac/m4a/amr/ogg 等格式，仅改了扩展名。\n" +
+                                    "请用格式转换工具转为 mp3 或 wav 后重试。"
+                        )
                     } else {
+                        val fmt = if (mime == "audio/wav") "WAV" else "MP3"
                         cloneBytes = bytes
-                        cloneName = name
                         cloneMime = mime
-                        Toast.makeText(
-                            context,
-                            "已选择 ${bytes.size / 1024} KB（base64 后需 ≤10MB）",
-                            Toast.LENGTH_SHORT
-                        ).show()
+                        cloneInfo = "$fmt · ${bytes.size / 1024} KB"
+                        Toast.makeText(context, "已识别 $fmt 音频（${bytes.size / 1024} KB）", Toast.LENGTH_SHORT).show()
                     }
                 }
             } catch (e: Exception) {
@@ -286,52 +285,117 @@ fun TtsScreen() {
                 2 -> {
                     OutlinedButton(
                         onClick = {
-                            pickAudio.launch(arrayOf("audio/mpeg", "audio/mp3", "audio/wav", "audio/x-wav"))
+                            pickAudio.launch(
+                                arrayOf(
+                                    "audio/mpeg", "audio/mp3", "audio/wav", "audio/x-wav",
+                                    "audio/mp4", "audio/aac", "audio/ogg", "audio/*"
+                                )
+                            )
                         },
                         modifier = Modifier.fillMaxWidth()
                     ) {
-                        Icon(Icons.Default.History, contentDescription = null)
+                        Icon(Icons.Default.MusicNote, contentDescription = null)
                         Spacer(Modifier.width(8.dp))
                         Text(
                             if (cloneBytes == null) "选择音频样本（mp3/wav）"
-                            else "$cloneName（${cloneBytes!!.size / 1024} KB）点击更换"
+                            else "$cloneInfo · 点击更换"
+                        )
+                    }
+                    if (cloneBytes != null) {
+                        Text(
+                            "已就绪：$cloneInfo（base64 后需 ≤10MB）",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.primary
                         )
                     }
                 }
             }
 
-            // ── 风格标签 ──
-            Text("风格标签（可多选，加在文本开头）", style = MaterialTheme.typography.titleSmall)
+            // ── 文本模板 ──
+            Text("文本模板（点击填入）", style = MaterialTheme.typography.titleSmall)
             LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                items(XiaomiTtsClient.STYLE_TAGS) { tag ->
-                    FilterChip(
-                        selected = tag in selectedTags,
+                items(XiaomiTtsClient.TEXT_TEMPLATES.size) { i ->
+                    AssistChip(
                         onClick = {
-                            selectedTags = if (tag in selectedTags)
-                                selectedTags - tag else selectedTags + tag
+                            val t = XiaomiTtsClient.TEXT_TEMPLATES[i]
+                            textFieldValue = TextFieldValue(t, TextRange(t.length))
                         },
-                        label = { Text(tag) }
+                        label = {
+                            Text(
+                                XiaomiTtsClient.TEXT_TEMPLATES[i].take(8) +
+                                        if (XiaomiTtsClient.TEXT_TEMPLATES[i].length > 8) "…" else ""
+                            )
+                        }
                     )
                 }
             }
 
-            // ── 音频标签（插入光标处）──
-            Text("音频标签（点击插入到光标处）", style = MaterialTheme.typography.titleSmall)
-            LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                items(XiaomiTtsClient.AUDIO_TAGS) { tag ->
-                    AssistChip(
-                        onClick = {
-                            val insert = "（$tag）"
-                            val pos = textFieldValue.selection.start
-                            val newText = textFieldValue.text.substring(0, pos) +
-                                    insert + textFieldValue.text.substring(textFieldValue.selection.end)
-                            textFieldValue = TextFieldValue(
-                                newText,
-                                TextRange(pos + insert.length)
-                            )
-                        },
-                        label = { Text(tag) }
+            // ── 风格标签（分组，可折叠）──
+            Text("风格标签（可多选）", style = MaterialTheme.typography.titleSmall)
+            XiaomiTtsClient.STYLE_TAG_GROUPS.forEach { (group, tags) ->
+                Row(
+                    verticalAlignment = Alignment.Top,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(
+                        group,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier
+                            .width(36.dp)
+                            .padding(top = 10.dp)
                     )
+                    FlowRow(
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        tags.forEach { tag ->
+                            FilterChip(
+                                selected = tag in selectedTags,
+                                onClick = {
+                                    selectedTags = if (tag in selectedTags)
+                                        selectedTags - tag else selectedTags + tag
+                                },
+                                label = { Text(tag, style = MaterialTheme.typography.labelMedium) }
+                            )
+                        }
+                    }
+                }
+            }
+
+            // ── 音频标签（分组，插入光标处）──
+            Text("音频标签（插入光标处）", style = MaterialTheme.typography.titleSmall)
+            XiaomiTtsClient.AUDIO_TAG_GROUPS.forEach { (group, tags) ->
+                Row(
+                    verticalAlignment = Alignment.Top,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(
+                        group,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier
+                            .width(36.dp)
+                            .padding(top = 10.dp)
+                    )
+                    FlowRow(
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        tags.forEach { tag ->
+                            AssistChip(
+                                onClick = {
+                                    val insert = "（$tag）"
+                                    val pos = textFieldValue.selection.start
+                                    val newText = textFieldValue.text.substring(0, pos) +
+                                            insert + textFieldValue.text.substring(textFieldValue.selection.end)
+                                    textFieldValue = TextFieldValue(
+                                        newText,
+                                        TextRange(pos + insert.length)
+                                    )
+                                },
+                                label = { Text(tag, style = MaterialTheme.typography.labelMedium) }
+                            )
+                        }
+                    }
                 }
             }
 
@@ -342,12 +406,24 @@ fun TtsScreen() {
                 label = { Text("要合成的文本") },
                 modifier = Modifier.fillMaxWidth(),
                 minLines = 3,
-                maxLines = 8,
+                maxLines = 10,
+                trailingIcon = {
+                    if (textFieldValue.text.isNotEmpty()) {
+                        IconButton(onClick = {
+                            textFieldValue = TextFieldValue("")
+                        }) {
+                            Icon(Icons.Default.Close, contentDescription = "清空")
+                        }
+                    }
+                },
                 supportingText = {
+                    val n = textFieldValue.text.length
                     Text(
-                        "${textFieldValue.text.length} 字" +
-                                if (selectedTags.isNotEmpty()) " ｜ 已选: ${selectedTags.joinToString(" ")}"
-                                else "",
+                        buildString {
+                            append("$n 字")
+                            if (selectedTags.isNotEmpty()) append(" ｜ 风格: ${selectedTags.joinToString(" ")}")
+                            if (n > 500) append(" ｜ 长文本合成耗时较久")
+                        },
                         modifier = Modifier.fillMaxWidth()
                     )
                 }
@@ -355,13 +431,13 @@ fun TtsScreen() {
 
             // ── 高级：自然语言风格 ──
             TextButton(onClick = { showAdvanced = !showAdvanced }) {
-                Text(if (showAdvanced) "▾ 收起自然语言风格" else "▸ 自然语言风格（可选）")
+                Text(if (showAdvanced) "▾ 收起自然语言风格" else "▸ 自然语言风格 / 导演模式（可选）")
             }
             if (showAdvanced && mode != 1) {
                 OutlinedTextField(
                     value = naturalStyle,
                     onValueChange = { naturalStyle = it },
-                    label = { Text("自然语言风格 / 导演模式") },
+                    label = { Text("自然语言风格描述") },
                     modifier = Modifier.fillMaxWidth(),
                     minLines = 2,
                     placeholder = { Text("如：用轻快上扬的语调说，语速稍快") }
@@ -425,7 +501,7 @@ fun TtsScreen() {
                             refreshHistory()
                             currentFile?.let { playFile(it) }
                         } catch (e: Exception) {
-                            Toast.makeText(context, "合成失败: ${e.message}", Toast.LENGTH_LONG).show()
+                            showError("合成失败\n\n${e.message}")
                         } finally {
                             isLoading = false
                         }
@@ -580,6 +656,29 @@ fun TtsScreen() {
             },
             confirmButton = {
                 TextButton(onClick = { showKeyDialog = false }) { Text("完成") }
+            }
+        )
+    }
+
+    // ── 错误详情对话框 ──
+    errorMsg?.let { msg ->
+        AlertDialog(
+            onDismissRequest = { errorMsg = null },
+            title = { Text("出错了") },
+            text = {
+                SelectionContainer {
+                    Text(msg, style = MaterialTheme.typography.bodySmall)
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { errorMsg = null }) { Text("关闭") }
+            },
+            dismissButton = {
+                TextButton(onClick = {
+                    val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                    clipboard.setPrimaryClip(ClipData.newPlainText("error", msg))
+                    Toast.makeText(context, "已复制错误信息", Toast.LENGTH_SHORT).show()
+                }) { Text("复制") }
             }
         )
     }

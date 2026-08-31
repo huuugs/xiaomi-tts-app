@@ -11,12 +11,25 @@ android {
         applicationId = "com.xiaomi.tts.app"
         minSdk = 24
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0"
-
+        // CI 中通过 -PversionCode= 传入，实现版本号自动递增
+        versionCode = (project.findProperty("versionCode") as String?)?.toInt() ?: 1
+        versionName = "1.${versionCode}"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
             useSupportLibrary = true
+        }
+    }
+
+    // 固定签名：CI 从 GitHub Secrets 解码 release.keystore 后生效
+    signingConfigs {
+        create("release") {
+            val ksFile = file("release.keystore")
+            if (ksFile.exists()) {
+                storeFile = ksFile
+                storePassword = System.getenv("KEYSTORE_PASSWORD")
+                keyAlias = System.getenv("KEY_ALIAS")
+                keyPassword = System.getenv("KEY_PASSWORD")
+            }
         }
     }
 
@@ -27,6 +40,9 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
+            if (file("release.keystore").exists()) {
+                signingConfig = signingConfigs.getByName("release")
+            }
         }
     }
     compileOptions {

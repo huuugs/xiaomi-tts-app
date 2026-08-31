@@ -39,22 +39,34 @@ class XiaomiTtsClient(private val apiKey: String) {
             "Dean" to "Dean · 英文男"
         )
 
-        /** 风格标签（拼接在文本开头） */
-        val STYLE_TAGS = listOf(
-            "开心", "悲伤", "愤怒", "恐惧", "惊讶", "兴奋", "委屈", "平静", "冷漠",
-            "温柔", "高冷", "活泼", "严肃", "慵懒", "俏皮", "深沉", "干练",
-            "磁性", "醇厚", "清亮", "空灵", "甜美", "沙哑",
-            "东北话", "四川话", "河南话", "粤语",
-            "唱歌", "孙悟空", "林黛玉", "御姐音", "大叔音", "正太音", "台湾腔"
+        /** 风格标签分组（拼接在文本开头，可多选） */
+        val STYLE_TAG_GROUPS = listOf(
+            "情绪" to listOf("开心", "悲伤", "愤怒", "恐惧", "惊讶", "兴奋", "委屈", "平静", "冷漠", "无奈", "释然", "忐忑"),
+            "语调" to listOf("温柔", "高冷", "活泼", "严肃", "慵懒", "俏皮", "深沉", "干练"),
+            "音色" to listOf("磁性", "醇厚", "清亮", "空灵", "甜美", "沙哑", "稚嫩", "苍老"),
+            "方言" to listOf("东北话", "四川话", "河南话", "粤语"),
+            "角色" to listOf("孙悟空", "林黛玉", "御姐音", "大叔音", "正太音", "夹子音", "台湾腔"),
+            "唱歌" to listOf("唱歌")
         )
 
-        /** 音频标签（插入光标处，细粒度控制） */
-        val AUDIO_TAGS = listOf(
-            "叹气", "深呼吸", "吸气", "长叹一口气", "沉默片刻",
-            "笑", "轻笑", "大笑", "冷笑",
-            "哽咽", "抽泣", "呜咽", "哭",
-            "小声", "大声", "气声", "颤抖", "语速加快", "语速放慢",
-            "紧张", "疲惫", "激动", "撒娇", "心虚", "震惊", "不耐烦"
+        /** 音频标签分组（插入光标处，细粒度控制） */
+        val AUDIO_TAG_GROUPS = listOf(
+            "呼吸" to listOf("吸气", "深呼吸", "叹气", "长叹一口气", "喘息", "屏息", "沉默片刻"),
+            "笑" to listOf("笑", "轻笑", "大笑", "冷笑"),
+            "哭" to listOf("哽咽", "抽泣", "呜咽", "哭", "嚎啕大哭"),
+            "声音" to listOf("小声", "大声", "气声", "颤抖", "变调", "破音", "鼻音"),
+            "语速" to listOf("语速加快", "语速放慢"),
+            "状态" to listOf("紧张", "害怕", "激动", "疲惫", "撒娇", "心虚", "震惊", "不耐烦")
+        )
+
+        /** 文本模板 */
+        val TEXT_TEMPLATES = listOf(
+            "你好，我是小米语音合成模型，很高兴认识你！",
+            "各位观众朋友大家好，欢迎收看今天的新闻节目。",
+            "很久很久以前，在一个遥远的王国里，住着一位美丽的公主。",
+            "（唱歌）原谅我这一生不羁放纵爱自由，也会怕有一天会跌倒。",
+            "（紧张，深呼吸）呼……冷静，冷静。不就是一个面试吗……加油，你可以的。",
+            "夜已经深了，城市还在呼吸。我是今晚陪你的人，欢迎收听《午夜电台》。"
         )
 
         /** 音色设计模板 */
@@ -74,6 +86,22 @@ class XiaomiTtsClient(private val apiKey: String) {
             }
             return dataUri
         }
+
+        /**
+         * 魔数检测真实音频格式（不信任扩展名/MIME）
+         * API 仅支持 mp3 / wav
+         */
+        fun detectAudioMime(bytes: ByteArray): String? = when {
+            bytes.size >= 12 &&
+                    String(bytes, 0, 4) == "RIFF" &&
+                    String(bytes, 8, 4) == "WAVE" -> "audio/wav"
+            bytes.size >= 3 && String(bytes, 0, 3) == "ID3" -> "audio/mpeg"
+            // MPEG 帧同步 0xFF Ex（mp3 无 ID3 头时）
+            bytes.size >= 2 &&
+                    (bytes[0].toInt() and 0xFF) == 0xFF &&
+                    (bytes[1].toInt() and 0xE0) == 0xE0 -> "audio/mpeg"
+            else -> null
+        }
     }
 
     private val client = OkHttpClient.Builder()
@@ -90,7 +118,7 @@ class XiaomiTtsClient(private val apiKey: String) {
         } catch (e: Exception) {
             ""
         }
-        return IOException("API ${response.code}: ${errBody.take(300)}")
+        return IOException("API ${response.code}: ${errBody.take(500)}")
     }
 
     /**
