@@ -5,7 +5,11 @@ import android.media.MediaCodec
 import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.net.Uri
+import java.io.BufferedOutputStream
 import java.io.ByteArrayOutputStream
+import java.io.DataOutputStream
+import java.io.File
+import java.io.FileOutputStream
 import java.io.IOException
 
 /**
@@ -144,7 +148,7 @@ object AudioConverter {
         val blockAlign = channels * bitsPerSample / 8
         val byteRate = sampleRate * blockAlign
         val dataSize = pcmFile.length()
-        java.io.DataOutputStream(java.io.BufferedOutputStream(FileOutputStream(outFile))).use { dos ->
+        DataOutputStream(BufferedOutputStream(FileOutputStream(outFile))).use { dos ->
             fun le16(v: Long) {
                 dos.write((v and 0xFF).toInt()); dos.write(((v shr 8) and 0xFF).toInt())
             }
