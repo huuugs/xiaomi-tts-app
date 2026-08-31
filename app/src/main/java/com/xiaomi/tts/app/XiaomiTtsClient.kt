@@ -118,6 +118,11 @@ class XiaomiTtsClient(private val apiKey: String) {
             text: String,
             onProgress: (chunkIndex: Int, chunkTotal: Int, isOutput: Boolean, chars: Int) -> Unit = { _, _, _, _ -> }
         ): List<NovelSegment> {
+            LlmLogger.clear()
+            LlmLogger.event(
+                LlmLogger.TYPE_SYSTEM,
+                "分析开始：${text.length} 字，本地切分后 ${NovelParser.parse(text).size} 段"
+            )
             val segments = NovelParser.parse(text)
             if (segments.isEmpty()) return segments
 
@@ -141,6 +146,7 @@ class XiaomiTtsClient(private val apiKey: String) {
 
             chunks.forEachIndexed { ci, idxs ->
                 onProgress(ci + 1, chunks.size, true, 0)
+                LlmLogger.event(LlmLogger.TYPE_SYSTEM, "─── 第 ${ci + 1}/$chunks.size 块（${idxs.size} 段）───")
                 val labels = labelWithStrategies(apiKey, segments, idxs, known) { isOutput, chars ->
                     onProgress(ci + 1, chunks.size, isOutput, chars)
                 }
@@ -167,6 +173,10 @@ class XiaomiTtsClient(private val apiKey: String) {
             onDelta: (Boolean, Int) -> Unit = { _, _ -> }
         ): List<String> {
             val strategy = llmStrategies[strategyIdx]
+            LlmLogger.event(
+                LlmLogger.TYPE_SYSTEM,
+                "▶ 请求 ${strategy.model}${if (strategy.disableThinking) "（关思考）" else ""}"
+            )
             val system = "任务：为小说分段标注说话人。这是模式匹配任务，直接给出答案，不需要推理过程、不要解释。\n" +
                     "\n" +
                     "输入：分段数组，i=序号，d=0旁白/1对白，t=文本（可能截断）。\n" +
@@ -229,6 +239,8 @@ class XiaomiTtsClient(private val apiKey: String) {
                     val outSb = StringBuilder()
                     val thinkSb = StringBuilder()
                     var lastCb = 0
+                    var thinkLogged = false
+                    var outputLogged = false
                     response.body?.source()?.use { source ->
                         while (!source.exhausted()) {
                             val line = source.readUtf8Line() ?: break
@@ -253,6 +265,17 @@ class XiaomiTtsClient(private val apiKey: String) {
                                 if (changed && total - lastCb >= 30) {
                                     lastCb = total
                                     onDelta(outSb.isNotEmpty(), total)
+                                    // 写入交互日志
+                                    if (thinkSb.isNotEmpty() && !thinkLogged) {
+                                        LlmLogger.begin(LlmLogger.TYPE_THINKING)
+                                        thinkLogged = true
+                                    }
+                                    if (outSb.isNotEmpty() && !outputLogged) {
+                                        LlmLogger.begin(LlmLogger.TYPE_OUTPUT)
+                                        outputLogged = true
+                                    }
+                                    if (outSb.isNotEmpty()) LlmLogger.update(outSb.toString())
+                                    else if (thinkSb.isNotEmpty()) LlmLogger.update(thinkSb.toString())
                                 }
                             } catch (_: Exception) {
                                 continue
@@ -275,6 +298,7 @@ class XiaomiTtsClient(private val apiKey: String) {
                     if (labels.size != idxs.size) {
                         throw IOException("标注数量不符（${labels.size}/${idxs.size}），请重试")
                     }
+                    LlmLogger.event(LlmLogger.TYPE_SYSTEM, "✓ 完成，识别角色：${labels.distinct().joinToString("、")}")
                     return labels
                 }
         }
@@ -303,6 +327,10 @@ class XiaomiTtsClient(private val apiKey: String) {
                 } catch (e: IOException) {
                     val msg = e.message ?: ""
                     if ("API 400" in msg || "API 404" in msg || "API 422" in msg) {
+                        LlmLogger.event(
+                            LlmLogger.TYPE_SYSTEM,
+                            "⚠ 策略 ${llmStrategies[si].model}${if (llmStrategies[si].disableThinking) "(关思考)" else ""} 不可用，自动切换下一个\n${msg.take(150)}"
+                        )
                         lastErr = e
                         continue
                     }
@@ -329,6 +357,10 @@ class XiaomiTtsClient(private val apiKey: String) {
                     val msg = e.message ?: ""
                     if ("API 400" in msg || "API 404" in msg || "API 422" in msg) throw e
                     lastError = e
+                    LlmLogger.event(
+                        LlmLogger.TYPE_ERROR,
+                        "↻ 网络错误（${msg.take(100)}），${3 - attempt / 1 * 1}秒后重试 ${attempt + 1}/3"
+                    )
                     if (attempt < 3) {
                         try {
                             Thread.sleep((attempt + 1) * 4000L)

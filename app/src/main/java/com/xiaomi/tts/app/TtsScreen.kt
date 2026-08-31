@@ -18,6 +18,8 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
@@ -47,6 +49,7 @@ import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -346,6 +349,7 @@ fun TtsScreen() {
     var isAnalyzing by remember { mutableStateOf(false) }
     var analyzeProgress by remember { mutableStateOf("") }
     var analyzeDetail by remember { mutableStateOf("") }
+    var showLlmLog by remember { mutableStateOf(false) }
     var novelCurrentText by remember { mutableStateOf("") }
     var resumeState by remember { mutableStateOf<NovelBuildState?>(null) }
 
@@ -609,7 +613,7 @@ fun TtsScreen() {
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
                             Spacer(Modifier.width(8.dp))
-                            Column {
+                            Column(Modifier.weight(1f)) {
                                 Text(
                                     when {
                                         analyzeDetail.isNotEmpty() -> "AI 分析中（$analyzeProgress）"
@@ -625,6 +629,9 @@ fun TtsScreen() {
                                         color = MaterialTheme.colorScheme.primary
                                     )
                                 }
+                            }
+                            TextButton(onClick = { showLlmLog = true }) {
+                                Text("查看交互", style = MaterialTheme.typography.labelMedium)
                             }
                         }
                     } else {
@@ -1257,6 +1264,67 @@ fun TtsScreen() {
             },
             confirmButton = {
                 TextButton(onClick = { showKeyDialog = false }) { Text("完成") }
+            }
+        )
+    }
+
+    // ── LLM 交互日志对话框 ──
+    if (showLlmLog) {
+        val listState = rememberLazyListState()
+        var tick by remember { mutableIntStateOf(0) }
+        LaunchedEffect(Unit) {
+            while (true) {
+                delay(300)
+                tick++
+            }
+        }
+        val logs = remember(tick) { LlmLogger.snapshot() }
+        LaunchedEffect(logs.size) {
+            if (logs.isNotEmpty()) {
+                listState.animateScrollToItem(logs.size - 1)
+            }
+        }
+        AlertDialog(
+            onDismissRequest = { showLlmLog = false },
+            title = { Text("AI 交互日志") },
+            text = {
+                LazyColumn(
+                    state = listState,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(max = 460.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    items(count = logs.size) { i ->
+                        val e = logs[i]
+                        val (label, color) = when (e.type) {
+                            LlmLogger.TYPE_THINKING -> "💭 思考" to MaterialTheme.colorScheme.onSurfaceVariant
+                            LlmLogger.TYPE_OUTPUT -> "✎ 输出" to MaterialTheme.colorScheme.primary
+                            LlmLogger.TYPE_ERROR -> "⚠ 错误" to MaterialTheme.colorScheme.error
+                            else -> "ℹ" to MaterialTheme.colorScheme.onSurface
+                        }
+                        Column {
+                            Text(
+                                label,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = color
+                            )
+                            SelectionContainer {
+                                Text(
+                                    text = if (e.text.isEmpty()) "（进行中…）"
+                                    else e.text.take(1200) + if (e.text.length > 1200) "\n…（共 ${e.text.length} 字）" else "",
+                                    style = MaterialTheme.typography.bodySmall
+                                )
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                Row {
+                    TextButton(onClick = { LlmLogger.clear(); tick++ }) { Text("清空") }
+                    TextButton(onClick = { showLlmLog = false }) { Text("关闭") }
+                }
             }
         )
     }
