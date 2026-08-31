@@ -112,7 +112,7 @@ class XiaomiTtsClient(private val apiKey: String) {
 
             val requestBody = JsonObject().apply {
                 addProperty("model", LLM_MODEL)
-                add("messages", gson.toJsonTree(listOf(
+                add("messages", llmGson.toJsonTree(listOf(
                     mapOf("role" to "system", "content" to system),
                     mapOf("role" to "user", "content" to limited)
                 )))
