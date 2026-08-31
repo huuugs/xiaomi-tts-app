@@ -16,16 +16,18 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.lazy.LazyRow
-import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.ArrowDropDown
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.History
+import androidx.compose.material.icons.filled.Label
+import androidx.compose.material.icons.filled.LibraryMusic
 import androidx.compose.material.icons.filled.MusicNote
+import androidx.compose.material.icons.filled.Notes
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Save
 import androidx.compose.material.icons.filled.Settings
@@ -81,6 +83,114 @@ fun exportAudioToMusic(context: Context, data: ByteArray): String {
     }
 }
 
+// ── 分组标签选择对话框（风格多选 / 音频标签插入） ──
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+fun TagPickerDialog(
+    title: String,
+    groups: List<Pair<String, List<String>>>,
+    selected: Set<String> = emptySet(),
+    multiSelect: Boolean = false,
+    onDismiss: () -> Unit,
+    onConfirm: (Set<String>) -> Unit = {},
+    onPick: (String) -> Unit = {}
+) {
+    var temp by remember { mutableStateOf(selected) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(title) },
+        text = {
+            Column(
+                modifier = Modifier
+                    .heightIn(max = 420.dp)
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                groups.forEach { (group, tags) ->
+                    Row(verticalAlignment = Alignment.Top, modifier = Modifier.fillMaxWidth()) {
+                        Text(
+                            group,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier
+                                .width(40.dp)
+                                .padding(top = 10.dp)
+                        )
+                        FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            tags.forEach { tag ->
+                                if (multiSelect) {
+                                    FilterChip(
+                                        selected = tag in temp,
+                                        onClick = {
+                                            temp = if (tag in temp) temp - tag else temp + tag
+                                        },
+                                        label = { Text(tag, style = MaterialTheme.typography.labelMedium) }
+                                    )
+                                } else {
+                                    AssistChip(
+                                        onClick = { onPick(tag); onDismiss() },
+                                        label = { Text(tag, style = MaterialTheme.typography.labelMedium) }
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            if (multiSelect) {
+                TextButton(onClick = { onConfirm(temp) }) { Text("确定") }
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("取消") }
+        }
+    )
+}
+
+// ── 列表选择下拉框 ──
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun <T> DropdownSelector(
+    label: String,
+    items: List<T>,
+    itemLabel: (T) -> String,
+    selected: T,
+    onSelect: (T) -> Unit
+) {
+    var expanded by remember { mutableStateOf(false) }
+    ExposedDropdownMenuBox(
+        expanded = expanded,
+        onExpandedChange = { expanded = it }
+    ) {
+        OutlinedTextField(
+            value = itemLabel(selected),
+            onValueChange = {},
+            readOnly = true,
+            label = { Text(label) },
+            trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded) },
+            modifier = Modifier
+                .fillMaxWidth()
+                .menuAnchor()
+        )
+        ExposedDropdownMenu(
+            expanded = expanded,
+            onDismissRequest = { expanded = false }
+        ) {
+            items.forEach { item ->
+                DropdownMenuItem(
+                    text = { Text(itemLabel(item)) },
+                    onClick = {
+                        onSelect(item)
+                        expanded = false
+                    }
+                )
+            }
+        }
+    }
+}
+
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
 fun TtsScreen() {
@@ -95,18 +205,14 @@ fun TtsScreen() {
         prefs.edit().putString("api_key", key).apply()
     }
 
-    // 错误详情对话框
     var errorMsg by remember { mutableStateOf<String?>(null) }
-    fun showError(msg: String) {
-        errorMsg = msg
-    }
 
-    // 模式：0 预置音色 / 1 音色设计 / 2 音色克隆
+    // 模式
     var mode by remember { mutableIntStateOf(0) }
     val modes = listOf("预置音色", "音色设计", "音色克隆")
     val modelIds = listOf("mimo-v2.5-tts", "mimo-v2.5-tts-voicedesign", "mimo-v2.5-tts-voiceclone")
 
-    // 模式相关状态
+    // 模式状态
     var selectedVoice by remember { mutableStateOf("mimo_default") }
     var voiceDesignPrompt by remember { mutableStateOf("") }
     var optimizePreview by remember { mutableStateOf(false) }
@@ -119,7 +225,13 @@ fun TtsScreen() {
     var textFieldValue by remember { mutableStateOf(TextFieldValue("")) }
     var selectedTags by remember { mutableStateOf(setOf<String>()) }
     var naturalStyle by remember { mutableStateOf("") }
-    var showAdvanced by remember { mutableStateOf(false) }
+    var showNaturalStyle by remember { mutableStateOf(false) }
+
+    // 对话框开关
+    var showStyleDialog by remember { mutableStateOf(false) }
+    var showAudioTagDialog by remember { mutableStateOf(false) }
+    var showTemplateDialog by remember { mutableStateOf(false) }
+    var showHistory by remember { mutableStateOf(false) }
 
     // 结果与历史
     var isLoading by remember { mutableStateOf(false) }
@@ -152,7 +264,7 @@ fun TtsScreen() {
             }
             isPlaying = true
         } catch (e: Exception) {
-            showError("播放失败: ${e.message}")
+            errorMsg = "播放失败: ${e.message}"
         }
     }
 
@@ -164,7 +276,7 @@ fun TtsScreen() {
                 val path = withContext(Dispatchers.IO) { exportAudioToMusic(context, data) }
                 Toast.makeText(context, "已导出: $path", Toast.LENGTH_LONG).show()
             } catch (e: Exception) {
-                showError("导出失败: ${e.message}")
+                errorMsg = "导出失败\n\n${e.message}"
             } finally {
                 isExporting = false
             }
@@ -178,7 +290,7 @@ fun TtsScreen() {
         else Toast.makeText(context, "未授予存储权限，无法导出", Toast.LENGTH_SHORT).show()
     }
 
-    // 选择克隆音频样本：mp3/wav 直接用，其他格式自动转码为 WAV
+    // 选择克隆音频：mp3/wav 直接用，其他自动转码
     val pickAudio = rememberLauncherForActivityResult(
         ActivityResultContracts.OpenDocument()
     ) { uri ->
@@ -194,29 +306,19 @@ fun TtsScreen() {
                         if (m != null) {
                             Triple(raw, m, if (m == "audio/wav") "WAV" else "MP3")
                         } else {
-                            // 非 mp3/wav：离线自动转码（m4a/aac/ogg/amr/flac/视频音轨等）
                             val wav = AudioConverter.decodeToWav(context, uri)
                             Triple(wav, "audio/wav", "WAV·已转换")
                         }
                     }
-                    // 提前校验 base64 后大小（≤10MB），避免合成时才报错
                     XiaomiTtsClient.buildCloneVoice(mime, bytes)
                     cloneBytes = bytes
                     cloneMime = mime
                     cloneInfo = "$fmtName · ${bytes.size / 1024} KB"
-                    Toast.makeText(
-                        context,
-                        "音频已就绪（$fmtName ${bytes.size / 1024} KB）",
-                        Toast.LENGTH_SHORT
-                    ).show()
+                    Toast.makeText(context, "音频已就绪（$fmtName ${bytes.size / 1024} KB）", Toast.LENGTH_SHORT).show()
                 } catch (e: Exception) {
                     cloneBytes = null
                     cloneInfo = ""
-                    showError(
-                        "音频处理失败\n\n${e.message}\n\n" +
-                                "支持：MP3 / WAV 直接使用；" +
-                                "M4A / AAC / OGG / AMR / FLAC / 视频音轨自动转为 WAV。"
-                    )
+                    errorMsg = "音频处理失败\n\n${e.message}\n\n支持：MP3 / WAV 直接使用；M4A / AAC / OGG / AMR / FLAC / 视频音轨自动转为 WAV。"
                 } finally {
                     isConverting = false
                 }
@@ -246,32 +348,26 @@ fun TtsScreen() {
                 .padding(padding)
                 .padding(horizontal = 16.dp)
                 .verticalScroll(rememberScrollState()),
-            verticalArrangement = Arrangement.spacedBy(12.dp)
+            verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
             // ── 模式 Tab ──
             TabRow(selectedTabIndex = mode) {
                 modes.forEachIndexed { i, title ->
-                    Tab(
-                        selected = mode == i,
-                        onClick = { mode = i },
-                        text = { Text(title) }
-                    )
+                    Tab(selected = mode == i, onClick = { mode = i }, text = { Text(title) })
                 }
             }
 
-            // ── 模式配置区 ──
+            // ── 模式配置（紧凑，下拉/单行）──
             when (mode) {
                 0 -> {
-                    Text("选择音色", style = MaterialTheme.typography.titleSmall)
-                    LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        items(XiaomiTtsClient.PRESET_VOICES) { (id, label) ->
-                            FilterChip(
-                                selected = selectedVoice == id,
-                                onClick = { selectedVoice = id },
-                                label = { Text(label) }
-                            )
-                        }
-                    }
+                    val voiceItems = XiaomiTtsClient.PRESET_VOICES
+                    DropdownSelector(
+                        label = "音色",
+                        items = voiceItems,
+                        itemLabel = { it.second },
+                        selected = voiceItems.first { it.first == selectedVoice },
+                        onSelect = { selectedVoice = it.first }
+                    )
                 }
                 1 -> {
                     OutlinedTextField(
@@ -282,19 +378,17 @@ fun TtsScreen() {
                         minLines = 2,
                         placeholder = { Text("如：温柔的女声，语速慢，像深夜电台主播") }
                     )
-                    Text("快捷模板", style = MaterialTheme.typography.titleSmall)
-                    LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        items(XiaomiTtsClient.VOICE_DESIGN_TEMPLATES.size) { i ->
-                            AssistChip(
-                                onClick = { voiceDesignPrompt = XiaomiTtsClient.VOICE_DESIGN_TEMPLATES[i] },
-                                label = { Text("模板 ${i + 1}") }
-                            )
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        TextButton(onClick = { showTemplateDialog = true }) {
+                            Icon(Icons.Default.Notes, null, Modifier.size(16.dp))
+                            Text(" 描述模板")
                         }
-                    }
-                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Spacer(Modifier.weight(1f))
                         Switch(checked = optimizePreview, onCheckedChange = { optimizePreview = it })
-                        Spacer(Modifier.width(8.dp))
-                        Text("智能润色文本", style = MaterialTheme.typography.bodyMedium)
+                        Text("润色", style = MaterialTheme.typography.bodySmall)
                     }
                 }
                 2 -> {
@@ -311,138 +405,29 @@ fun TtsScreen() {
                         enabled = !isConverting
                     ) {
                         if (isConverting) {
-                            CircularProgressIndicator(
-                                modifier = Modifier.size(18.dp),
-                                strokeWidth = 2.dp
-                            )
+                            CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
                             Spacer(Modifier.width(8.dp))
-                            Text("转换中…（解码并封装 WAV）")
+                            Text("转换中…")
                         } else {
-                            Icon(Icons.Default.MusicNote, contentDescription = null)
+                            Icon(Icons.Default.MusicNote, null)
                             Spacer(Modifier.width(8.dp))
-                            Text(
-                                if (cloneBytes == null) "选择音频样本（自动支持常见格式）"
-                                else "$cloneInfo · 点击更换"
-                            )
-                        }
-                    }
-                    if (cloneBytes != null) {
-                        Text(
-                            "已就绪：$cloneInfo（base64 后需 ≤10MB）",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.primary
-                        )
-                    } else {
-                        Text(
-                            "支持 MP3/WAV 直接使用；M4A/AAC/OGG/AMR/FLAC/视频音轨自动转 WAV",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    }
-                }
-            }
-
-            // ── 文本模板 ──
-            Text("文本模板（点击填入）", style = MaterialTheme.typography.titleSmall)
-            LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                items(XiaomiTtsClient.TEXT_TEMPLATES.size) { i ->
-                    AssistChip(
-                        onClick = {
-                            val t = XiaomiTtsClient.TEXT_TEMPLATES[i]
-                            textFieldValue = TextFieldValue(t, TextRange(t.length))
-                        },
-                        label = {
-                            Text(
-                                XiaomiTtsClient.TEXT_TEMPLATES[i].take(8) +
-                                        if (XiaomiTtsClient.TEXT_TEMPLATES[i].length > 8) "…" else ""
-                            )
-                        }
-                    )
-                }
-            }
-
-            // ── 风格标签（分组，可折叠）──
-            Text("风格标签（可多选）", style = MaterialTheme.typography.titleSmall)
-            XiaomiTtsClient.STYLE_TAG_GROUPS.forEach { (group, tags) ->
-                Row(
-                    verticalAlignment = Alignment.Top,
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Text(
-                        group,
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier
-                            .width(36.dp)
-                            .padding(top = 10.dp)
-                    )
-                    FlowRow(
-                        horizontalArrangement = Arrangement.spacedBy(6.dp)
-                    ) {
-                        tags.forEach { tag ->
-                            FilterChip(
-                                selected = tag in selectedTags,
-                                onClick = {
-                                    selectedTags = if (tag in selectedTags)
-                                        selectedTags - tag else selectedTags + tag
-                                },
-                                label = { Text(tag, style = MaterialTheme.typography.labelMedium) }
-                            )
+                            Text(if (cloneBytes == null) "选择音频样本（自动支持常见格式）" else "$cloneInfo · 更换")
                         }
                     }
                 }
             }
 
-            // ── 音频标签（分组，插入光标处）──
-            Text("音频标签（插入光标处）", style = MaterialTheme.typography.titleSmall)
-            XiaomiTtsClient.AUDIO_TAG_GROUPS.forEach { (group, tags) ->
-                Row(
-                    verticalAlignment = Alignment.Top,
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Text(
-                        group,
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier
-                            .width(36.dp)
-                            .padding(top = 10.dp)
-                    )
-                    FlowRow(
-                        horizontalArrangement = Arrangement.spacedBy(6.dp)
-                    ) {
-                        tags.forEach { tag ->
-                            AssistChip(
-                                onClick = {
-                                    val insert = "（$tag）"
-                                    val pos = textFieldValue.selection.start
-                                    val newText = textFieldValue.text.substring(0, pos) +
-                                            insert + textFieldValue.text.substring(textFieldValue.selection.end)
-                                    textFieldValue = TextFieldValue(
-                                        newText,
-                                        TextRange(pos + insert.length)
-                                    )
-                                },
-                                label = { Text(tag, style = MaterialTheme.typography.labelMedium) }
-                            )
-                        }
-                    }
-                }
-            }
-
-            // ── 文本输入 ──
+            // ── 文本输入（首屏核心区）──
             OutlinedTextField(
                 value = textFieldValue,
                 onValueChange = { textFieldValue = it },
                 label = { Text("要合成的文本") },
                 modifier = Modifier.fillMaxWidth(),
-                minLines = 3,
+                minLines = 4,
                 maxLines = 10,
                 trailingIcon = {
                     if (textFieldValue.text.isNotEmpty()) {
-                        IconButton(onClick = {
-                            textFieldValue = TextFieldValue("")
-                        }) {
+                        IconButton(onClick = { textFieldValue = TextFieldValue("") }) {
                             Icon(Icons.Default.Close, contentDescription = "清空")
                         }
                     }
@@ -453,22 +438,64 @@ fun TtsScreen() {
                         buildString {
                             append("$n 字")
                             if (selectedTags.isNotEmpty()) append(" ｜ 风格: ${selectedTags.joinToString(" ")}")
-                            if (n > 500) append(" ｜ 长文本合成耗时较久")
-                        },
-                        modifier = Modifier.fillMaxWidth()
+                            if (n > 500) append(" ｜ 长文本耗时较久")
+                        }
                     )
                 }
             )
 
-            // ── 高级：自然语言风格 ──
-            TextButton(onClick = { showAdvanced = !showAdvanced }) {
-                Text(if (showAdvanced) "▾ 收起自然语言风格" else "▸ 自然语言风格 / 导演模式（可选）")
+            // ── 工具行：风格 / 音频标签 / 模板 / 自然语言 ──
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedButton(onClick = { showStyleDialog = true }, modifier = Modifier.weight(1f)) {
+                    Icon(Icons.Default.Label, null, Modifier.size(16.dp))
+                    Spacer(Modifier.width(4.dp))
+                    Text(if (selectedTags.isEmpty()) "风格" else "风格 ${selectedTags.size}")
+                }
+                OutlinedButton(onClick = { showAudioTagDialog = true }, modifier = Modifier.weight(1f)) {
+                    Icon(Icons.Default.LibraryMusic, null, Modifier.size(16.dp))
+                    Spacer(Modifier.width(4.dp))
+                    Text("音频标签")
+                }
             }
-            if (showAdvanced && mode != 1) {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedButton(onClick = { showTemplateDialog = true }, modifier = Modifier.weight(1f)) {
+                    Icon(Icons.Default.Notes, null, Modifier.size(16.dp))
+                    Spacer(Modifier.width(4.dp))
+                    Text("文本模板")
+                }
+                OutlinedButton(
+                    onClick = { showNaturalStyle = !showNaturalStyle },
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Text(if (showNaturalStyle) "▾ 自然语言风格" else "▸ 自然语言风格")
+                }
+            }
+
+            // 已选风格标签（可单个移除）
+            if (selectedTags.isNotEmpty()) {
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    selectedTags.forEach { tag ->
+                        InputChip(
+                            selected = true,
+                            onClick = { selectedTags = selectedTags - tag },
+                            label = { Text(tag, style = MaterialTheme.typography.labelMedium) },
+                            trailingIcon = {
+                                Icon(
+                                    Icons.Default.Close, "移除",
+                                    Modifier.size(14.dp)
+                                )
+                            }
+                        )
+                    }
+                }
+            }
+
+            // 自然语言风格（折叠）
+            if (showNaturalStyle && mode != 1) {
                 OutlinedTextField(
                     value = naturalStyle,
                     onValueChange = { naturalStyle = it },
-                    label = { Text("自然语言风格描述") },
+                    label = { Text("自然语言风格 / 导演模式") },
                     modifier = Modifier.fillMaxWidth(),
                     minLines = 2,
                     placeholder = { Text("如：用轻快上扬的语调说，语速稍快") }
@@ -532,7 +559,7 @@ fun TtsScreen() {
                             refreshHistory()
                             currentFile?.let { playFile(it) }
                         } catch (e: Exception) {
-                            showError("合成失败\n\n${e.message}")
+                            errorMsg = "合成失败\n\n${e.message}"
                         } finally {
                             isLoading = false
                         }
@@ -543,14 +570,13 @@ fun TtsScreen() {
             ) {
                 if (isLoading) {
                     CircularProgressIndicator(
-                        modifier = Modifier.size(20.dp),
-                        strokeWidth = 2.dp,
+                        Modifier.size(20.dp), strokeWidth = 2.dp,
                         color = MaterialTheme.colorScheme.onPrimary
                     )
                     Spacer(Modifier.width(8.dp))
-                    Text("合成中…（长文本可能需要 1-2 分钟）")
+                    Text("合成中…（长文本可能 1-2 分钟）")
                 } else {
-                    Icon(Icons.Default.PlayArrow, contentDescription = null)
+                    Icon(Icons.Default.PlayArrow, null)
                     Spacer(Modifier.width(8.dp))
                     Text("开始合成")
                 }
@@ -570,10 +596,7 @@ fun TtsScreen() {
                         },
                         modifier = Modifier.weight(1f)
                     ) {
-                        Icon(
-                            if (isPlaying) Icons.Default.Stop else Icons.Default.PlayArrow,
-                            contentDescription = null
-                        )
+                        Icon(if (isPlaying) Icons.Default.Stop else Icons.Default.PlayArrow, null)
                         Text(if (isPlaying) " 停止" else " 重播")
                     }
                     OutlinedButton(
@@ -590,71 +613,65 @@ fun TtsScreen() {
                         modifier = Modifier.weight(1f),
                         enabled = !isExporting
                     ) {
-                        Icon(Icons.Default.Save, contentDescription = null)
+                        Icon(Icons.Default.Save, null)
                         Text(if (isExporting) " 导出中…" else " 导出")
                     }
                 }
             }
 
-            // ── 历史记录 ──
+            // ── 历史（默认折叠）──
             if (history.isNotEmpty()) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Icon(
-                        Icons.Default.History, contentDescription = null,
-                        modifier = Modifier.size(18.dp)
-                    )
-                    Spacer(Modifier.width(4.dp))
-                    Text("历史记录", style = MaterialTheme.typography.titleSmall)
+                TextButton(onClick = { showHistory = !showHistory }, modifier = Modifier.fillMaxWidth()) {
+                    Icon(Icons.Default.History, null, Modifier.size(16.dp))
+                    Text(if (showHistory) " 收起历史（${history.size}）" else " 展开历史（${history.size}）")
                 }
-                history.forEach { item ->
-                    Card(
-                        modifier = Modifier.fillMaxWidth(),
-                        colors = CardDefaults.cardColors(
-                            containerColor = MaterialTheme.colorScheme.surfaceVariant
-                        )
-                    ) {
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(horizontal = 12.dp, vertical = 8.dp),
-                            verticalAlignment = Alignment.CenterVertically
+                if (showHistory) {
+                    history.forEach { item ->
+                        Card(
+                            modifier = Modifier.fillMaxWidth(),
+                            colors = CardDefaults.cardColors(
+                                containerColor = MaterialTheme.colorScheme.surfaceVariant
+                            )
                         ) {
-                            Column(
+                            Row(
                                 modifier = Modifier
-                                    .weight(1f)
-                                    .clickable {
-                                        scope.launch {
-                                            audioData = withContext(Dispatchers.IO) {
-                                                if (item.file.exists()) item.file.readBytes() else null
-                                            }
-                                            currentFile = item.file
-                                        }
-                                        playFile(item.file)
-                                    }
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 12.dp, vertical = 8.dp),
+                                verticalAlignment = Alignment.CenterVertically
                             ) {
-                                Text(
-                                    "${item.timeText()} · ${item.modeName}",
-                                    style = MaterialTheme.typography.labelSmall
-                                )
-                                Text(
-                                    item.preview(),
-                                    style = MaterialTheme.typography.bodySmall,
-                                    maxLines = 2
-                                )
-                            }
-                            IconButton(onClick = {
-                                HistoryStore.delete(item.id)
-                                if (currentFile == item.file) {
-                                    audioData = null
-                                    currentFile = null
+                                Column(
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .clickable {
+                                            scope.launch {
+                                                audioData = withContext(Dispatchers.IO) {
+                                                    if (item.file.exists()) item.file.readBytes() else null
+                                                }
+                                                currentFile = item.file
+                                            }
+                                            playFile(item.file)
+                                        }
+                                ) {
+                                    Text(
+                                        "${item.timeText()} · ${item.modeName}",
+                                        style = MaterialTheme.typography.labelSmall
+                                    )
+                                    Text(
+                                        item.preview(),
+                                        style = MaterialTheme.typography.bodySmall,
+                                        maxLines = 2
+                                    )
                                 }
-                                refreshHistory()
-                            }) {
-                                Icon(
-                                    Icons.Default.Delete,
-                                    contentDescription = "删除",
-                                    tint = MaterialTheme.colorScheme.error
-                                )
+                                IconButton(onClick = {
+                                    HistoryStore.delete(item.id)
+                                    if (currentFile == item.file) {
+                                        audioData = null
+                                        currentFile = null
+                                    }
+                                    refreshHistory()
+                                }) {
+                                    Icon(Icons.Default.Delete, "删除", tint = MaterialTheme.colorScheme.error)
+                                }
                             }
                         }
                     }
@@ -665,7 +682,76 @@ fun TtsScreen() {
         }
     }
 
-    // ── API Key 设置对话框 ──
+    // ── 风格标签对话框（多选）──
+    if (showStyleDialog) {
+        TagPickerDialog(
+            title = "风格标签（可多选）",
+            groups = XiaomiTtsClient.STYLE_TAG_GROUPS,
+            selected = selectedTags,
+            multiSelect = true,
+            onDismiss = { showStyleDialog = false },
+            onConfirm = { selectedTags = it; showStyleDialog = false }
+        )
+    }
+
+    // ── 音频标签对话框（点击插入光标处）──
+    if (showAudioTagDialog) {
+        TagPickerDialog(
+            title = "音频标签（插入到光标处）",
+            groups = XiaomiTtsClient.AUDIO_TAG_GROUPS,
+            multiSelect = false,
+            onDismiss = { showAudioTagDialog = false },
+            onPick = { tag ->
+                val insert = "（$tag）"
+                val pos = textFieldValue.selection.start
+                val newText = textFieldValue.text.substring(0, pos) +
+                        insert + textFieldValue.text.substring(textFieldValue.selection.end)
+                textFieldValue = TextFieldValue(newText, TextRange(pos + insert.length))
+            }
+        )
+    }
+
+    // ── 模板对话框（点击填入）──
+    if (showTemplateDialog) {
+        AlertDialog(
+            onDismissRequest = { showTemplateDialog = false },
+            title = { Text(if (mode == 1) "音色描述模板" else "文本模板") },
+            text = {
+                Column(
+                    modifier = Modifier
+                        .heightIn(max = 420.dp)
+                        .verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    val templates = if (mode == 1) XiaomiTtsClient.VOICE_DESIGN_TEMPLATES
+                    else XiaomiTtsClient.TEXT_TEMPLATES
+                    templates.forEachIndexed { i, t ->
+                        OutlinedCard(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable {
+                                    if (mode == 1) voiceDesignPrompt = t
+                                    else textFieldValue = TextFieldValue(t, TextRange(t.length))
+                                    showTemplateDialog = false
+                                }
+                        ) {
+                            Text(
+                                t,
+                                style = MaterialTheme.typography.bodySmall,
+                                maxLines = 3,
+                                modifier = Modifier.padding(10.dp)
+                            )
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { showTemplateDialog = false }) { Text("关闭") }
+            }
+        )
+    }
+
+    // ── API Key 对话框 ──
     if (showKeyDialog) {
         AlertDialog(
             onDismissRequest = { showKeyDialog = false },
@@ -679,10 +765,7 @@ fun TtsScreen() {
                         visualTransformation = PasswordVisualTransformation(),
                         modifier = Modifier.fillMaxWidth()
                     )
-                    Text(
-                        "保存于本机。从小米 MiMo 开放平台获取。",
-                        style = MaterialTheme.typography.bodySmall
-                    )
+                    Text("保存于本机。从小米 MiMo 开放平台获取。", style = MaterialTheme.typography.bodySmall)
                 }
             },
             confirmButton = {
