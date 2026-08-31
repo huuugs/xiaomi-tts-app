@@ -101,7 +101,7 @@ class XiaomiTtsClient(private val apiKey: String) {
         fun llmAnalyze(
             apiKey: String,
             text: String,
-            onProgress: (Int, Int) -> Unit = { _, _ -> }
+            onProgress: (chunkIndex: Int, chunkTotal: Int, receivedChars: Int) -> Unit = { _, _, _ -> }
         ): List<NovelSegment> {
             val chunks = if (text.length <= LLM_MAX_CHARS) listOf(text)
             else text.chunked(LLM_MAX_CHARS)
@@ -109,8 +109,9 @@ class XiaomiTtsClient(private val apiKey: String) {
             val knownSpeakers = linkedSetOf<String>()
 
             chunks.forEachIndexed { i, chunk ->
-                onProgress(i + 1, chunks.size)
-                val segs = analyzeChunkWithRetry(apiKey, chunk, knownSpeakers)
+                val segs = analyzeChunkWithRetry(apiKey, chunk, knownSpeakers) { chars ->
+                    onProgress(i + 1, chunks.size, chars)
+                }
                 result += segs
                 segs.filter { it.isDialogue && it.speaker != "未标注" }
                     .forEach { knownSpeakers.add(it.speaker) }
@@ -123,12 +124,13 @@ class XiaomiTtsClient(private val apiKey: String) {
             apiKey: String,
             chunk: String,
             knownSpeakers: Set<String>,
+            onDelta: (Int) -> Unit = {},
             retries: Int = 3
         ): List<NovelSegment> {
             var lastError: IOException? = null
             for (attempt in 0..retries) {
                 try {
-                    return analyzeChunk(apiKey, chunk, knownSpeakers)
+                    return analyzeChunk(apiKey, chunk, knownSpeakers, onDelta)
                 } catch (e: IOException) {
                     lastError = e
                     if (attempt < retries) {
@@ -145,7 +147,8 @@ class XiaomiTtsClient(private val apiKey: String) {
         private fun analyzeChunk(
             apiKey: String,
             chunk: String,
-            knownSpeakers: Set<String>
+            knownSpeakers: Set<String>,
+            onDelta: (Int) -> Unit = {}
         ): List<NovelSegment> {
             val system = "你是小说剧本分析助手。把用户给的小说文本切分为朗读分段并标注说话者。\n" +
                     "规则：\n" +
@@ -167,6 +170,7 @@ class XiaomiTtsClient(private val apiKey: String) {
                     mapOf("role" to "user", "content" to chunk)
                 )))
                 addProperty("temperature", 0.1)
+                addProperty("stream", true)
             }
 
             val request = Request.Builder()
@@ -184,12 +188,35 @@ class XiaomiTtsClient(private val apiKey: String) {
                         val err = try { response.body?.string() ?: "" } catch (_: Exception) { "" }
                         throw IOException("智能分析 API ${response.code}: ${err.take(300)}")
                     }
-                    val body = response.body?.string() ?: throw IOException("响应为空")
-                    val content = JsonParser.parseString(body).asJsonObject
-                        .getAsJsonArray("choices")[0].asJsonObject
-                        .getAsJsonObject("message").get("content").asString
 
-                    // 剥离可能的 markdown 围栏/多余文字，提取最外层 JSON 数组
+                    // 流式接收：实时反馈已输出字符数
+                    val sb = StringBuilder()
+                    var lastCb = 0
+                    response.body?.source()?.use { source ->
+                        while (!source.exhausted()) {
+                            val line = source.readUtf8Line() ?: break
+                            if (!line.startsWith("data: ")) continue
+                            val data = line.substring(6)
+                            if (data.trim() == "[DONE]") break
+                            try {
+                                val obj = JsonParser.parseString(data).asJsonObject
+                                val choices = obj.getAsJsonArray("choices") ?: continue
+                                if (choices.size() == 0) continue
+                                val delta = choices[0].asJsonObject.getAsJsonObject("delta") ?: continue
+                                if (delta.has("content") && !delta.get("content").isJsonNull) {
+                                    sb.append(delta.get("content").asString)
+                                    if (sb.length - lastCb >= 100) {
+                                        lastCb = sb.length
+                                        onDelta(sb.length)
+                                    }
+                                }
+                            } catch (_: Exception) {
+                                continue
+                            }
+                        }
+                    }
+
+                    val content = sb.toString()
                     val start = content.indexOf('[')
                     val end = content.lastIndexOf(']')
                     if (start < 0 || end <= start) {

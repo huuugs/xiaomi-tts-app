@@ -345,6 +345,8 @@ fun TtsScreen() {
     var novelProgress by remember { mutableStateOf("") }
     var isAnalyzing by remember { mutableStateOf(false) }
     var analyzeProgress by remember { mutableStateOf("") }
+    var analyzeDetail by remember { mutableStateOf("") }
+    var novelCurrentText by remember { mutableStateOf("") }
     var resumeState by remember { mutableStateOf<NovelBuildState?>(null) }
 
     fun refreshHistory() {
@@ -607,11 +609,23 @@ fun TtsScreen() {
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
                             Spacer(Modifier.width(8.dp))
-                            Text(
-                                if (analyzeProgress.isEmpty()) "AI 分析中…（可能需要 30-60 秒）"
-                                else "AI 分析中…（$analyzeProgress）",
-                                style = MaterialTheme.typography.bodySmall
-                            )
+                            Column {
+                                Text(
+                                    when {
+                                        analyzeDetail.isNotEmpty() -> "AI 分析中（$analyzeProgress）"
+                                        analyzeProgress.isNotEmpty() -> "AI 分析中（$analyzeProgress）…"
+                                        else -> "AI 分析中…（可能需要 30-60 秒）"
+                                    },
+                                    style = MaterialTheme.typography.bodySmall
+                                )
+                                if (analyzeDetail.isNotEmpty()) {
+                                    Text(
+                                        analyzeDetail,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.primary
+                                    )
+                                }
+                            }
                         }
                     } else {
                         OutlinedButton(
@@ -623,10 +637,12 @@ fun TtsScreen() {
                                 scope.launch {
                                     isAnalyzing = true
                                     analyzeProgress = ""
+                                    analyzeDetail = ""
                                     try {
                                         val segs = withContext(Dispatchers.IO) {
-                                            XiaomiTtsClient.llmAnalyze(apiKey, novelFullText) { cur, total ->
+                                            XiaomiTtsClient.llmAnalyze(apiKey, novelFullText) { cur, total, chars ->
                                                 analyzeProgress = "$cur / $total 块"
+                                                analyzeDetail = "已接收 $chars 字"
                                             }
                                         }
                                         if (segs.isEmpty()) throw IOException("AI 未返回有效分段")
@@ -642,6 +658,7 @@ fun TtsScreen() {
                                         errorMsg = "智能分析失败\n\n${e.message}\n\n已保留规则解析结果"
                                     } finally {
                                         isAnalyzing = false
+                                        analyzeDetail = ""
                                     }
                                 }
                             },
@@ -695,6 +712,13 @@ fun TtsScreen() {
                             modifier = Modifier.fillMaxWidth()
                         )
                         Text("正在合成第 $novelProgress 段…", style = MaterialTheme.typography.bodySmall)
+                        if (novelCurrentText.isNotEmpty()) {
+                            Text(
+                                "“$novelCurrentText…”",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
                     }
 
                     Button(
@@ -716,6 +740,7 @@ fun TtsScreen() {
                                         FileOutputStream(pcmFile, startIdx > 0).use { out ->
                                             for (i in startIdx until novelSegments.size) {
                                                 novelProgress = "${i + 1}/${novelSegments.size}"
+                                                novelCurrentText = novelSegments[i].text.take(16)
                                                 val wav = XiaomiTtsClient(apiKey).synthesizeWithRetry(
                                                     TtsRequest(
                                                         model = "mimo-v2.5-tts",
