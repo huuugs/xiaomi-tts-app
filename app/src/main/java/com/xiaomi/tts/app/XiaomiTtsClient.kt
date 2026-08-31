@@ -130,7 +130,7 @@ class XiaomiTtsClient(private val apiKey: String) {
 
             chunks.forEachIndexed { ci, idxs ->
                 onProgress(ci + 1, chunks.size, 0)
-                val labels = labelChunkWithRetry(apiKey, segments, idxs, known) { chars ->
+                val labels = labelWithStrategies(apiKey, segments, idxs, known) { chars ->
                     onProgress(ci + 1, chunks.size, chars)
                 }
                 idxs.forEachIndexed { j, segIdx ->
@@ -152,18 +152,28 @@ class XiaomiTtsClient(private val apiKey: String) {
             segments: List<NovelSegment>,
             idxs: List<Int>,
             knownSpeakers: Set<String>,
+            strategyIdx: Int,
             onDelta: (Int) -> Unit = {}
         ): List<String> {
-            val system = "你是小说对白说话人标注助手。输入是分段数组（i=序号，d=1对白/0旁白，t=文本可能截断）。\n" +
-                    "推断每段说话人并只输出 JSON 字符串数组：\n" +
-                    "- d=0 的段输出 \"旁白\"\n" +
-                    "- d=1 的段输出角色名：优先用文本前的「XX说」提示；无提示时按上下文对话逻辑推断（注意对话轮替，同一角色说话风格一致）\n" +
-                    "- 完全无法判断输出 \"未标注\"\n" +
+            val strategy = llmStrategies[strategyIdx]
+            val system = "任务：为小说分段标注说话人。这是模式匹配任务，直接给出答案，不需要推理过程、不要解释。\n" +
+                    "\n" +
+                    "输入：分段数组，i=序号，d=0旁白/1对白，t=文本（可能截断）。\n" +
+                    "\n" +
+                    "规则（按优先级）：\n" +
+                    "1. d=0 → \"旁白\"\n" +
+                    "2. 对白前紧邻\"XX说道/问/喊/笑道/低声道…\"提示语 → XX 即说话人\n" +
+                    "3. 无提示语 → 依上下文推断：连续对白通常两人交替；结合自称（我/朕/俺）、称呼、语气判断\n" +
+                    "4. 推断不出 → \"未标注\"\n" +
+                    "5. 角色名优先沿用已知角色表，同一人物前后同名\n" +
                     (if (knownSpeakers.isNotEmpty())
-                        "- 已知角色（命名保持一致）：${knownSpeakers.joinToString("、")}\n"
+                        "\n已知角色：${knownSpeakers.joinToString("、")}\n"
                     else "") +
-                    "输出数组长度必须等于输入分段数量，不要输出任何其他内容。\n" +
-                    "示例输出：[\"旁白\",\"林清雪\",\"陈默\"]"
+                    "\n输出：纯 JSON 字符串数组，长度等于输入段数，按 i 顺序。\n" +
+                    "例：\n" +
+                    "输入 [{\"i\":0,\"d\":0,\"t\":\"夜色渐深\"},{\"i\":1,\"d\":1,\"t\":\"你来做什么？\"},{\"i\":2,\"d\":1,\"t\":\"我…我路过。\"}]\n" +
+                    "已知角色：林清雪、陈默\n" +
+                    "→ [\"旁白\",\"林清雪\",\"陈默\"]"
 
             // 输入压缩：旁白截 20 字（输出固定），对白截 120 字（推断足够）
             val input = idxs.map { i ->
@@ -175,13 +185,17 @@ class XiaomiTtsClient(private val apiKey: String) {
             }
 
             val requestBody = JsonObject().apply {
-                addProperty("model", LLM_MODEL)
+                addProperty("model", strategy.model)
                 add("messages", llmGson.toJsonTree(listOf(
                     mapOf("role" to "system", "content" to system),
                     mapOf("role" to "user", "content" to llmGson.toJson(input))
                 )))
                 addProperty("temperature", 0.1)
                 addProperty("stream", true)
+                // 思考型模型：禁用推理链，标注任务无需思考
+                if (strategy.disableThinking) {
+                    addProperty("enable_thinking", false)
+                }
             }
 
             val request = Request.Builder()
@@ -245,22 +259,57 @@ class XiaomiTtsClient(private val apiKey: String) {
                 }
         }
 
-        /** 带重试的标注（网络中断自动退避重试） */
+        /**
+         * 策略选择：缓存上次成功的策略，参数/模型不支持时自动降级（400/404/422）
+         */
+        private fun labelWithStrategies(
+            apiKey: String,
+            segments: List<NovelSegment>,
+            idxs: List<Int>,
+            knownSpeakers: Set<String>,
+            onDelta: (Int) -> Unit = {}
+        ): List<String> {
+            val cached = llmStrategyIdx
+            val order = if (cached != null)
+                listOf(cached) + llmStrategies.indices.filter { it != cached }
+            else llmStrategies.indices.toList()
+
+            var lastErr: IOException? = null
+            for (si in order) {
+                try {
+                    val r = labelChunkWithRetry(apiKey, segments, idxs, knownSpeakers, si, onDelta)
+                    llmStrategyIdx = si
+                    return r
+                } catch (e: IOException) {
+                    val msg = e.message ?: ""
+                    if ("API 400" in msg || "API 404" in msg || "API 422" in msg) {
+                        lastErr = e
+                        continue
+                    }
+                    throw e
+                }
+            }
+            throw lastErr ?: IOException("无可用模型策略")
+        }
+
+        /** 带重试的标注（网络错误退避重试；参数错误不重试直接上拋） */
         private fun labelChunkWithRetry(
             apiKey: String,
             segments: List<NovelSegment>,
             idxs: List<Int>,
             knownSpeakers: Set<String>,
-            retries: Int = 3,
+            strategyIdx: Int,
             onDelta: (Int) -> Unit = {}
         ): List<String> {
             var lastError: IOException? = null
-            for (attempt in 0..retries) {
+            for (attempt in 0..3) {
                 try {
-                    return labelChunk(apiKey, segments, idxs, knownSpeakers, onDelta)
+                    return labelChunk(apiKey, segments, idxs, knownSpeakers, strategyIdx, onDelta)
                 } catch (e: IOException) {
+                    val msg = e.message ?: ""
+                    if ("API 400" in msg || "API 404" in msg || "API 422" in msg) throw e
                     lastError = e
-                    if (attempt < retries) {
+                    if (attempt < 3) {
                         try {
                             Thread.sleep((attempt + 1) * 4000L)
                         } catch (_: InterruptedException) {
