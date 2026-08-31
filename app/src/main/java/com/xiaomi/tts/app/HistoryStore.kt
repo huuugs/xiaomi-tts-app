@@ -106,6 +106,36 @@ object HistoryStore {
     }
 
     /**
+     * 添加记录（音频已在文件中，流式拷贝入库，适合大文件）
+     */
+    fun addFile(model: String, modeName: String, text: String, wavFile: File): HistoryItem {
+        val now = System.currentTimeMillis()
+        val fileName = "tts_$now.wav"
+        val dest = File(HistoryItem.RECORDINGS_DIR, fileName)
+        wavFile.inputStream().use { input ->
+            dest.outputStream().use { input.copyTo(it) }
+        }
+        wavFile.delete()
+        val item = HistoryItem(
+            id = now,
+            time = now,
+            model = model,
+            modeName = modeName,
+            text = text,
+            fileName = fileName
+        )
+        val list = load()
+        list.add(item)
+        while (list.size > MAX_ITEMS) {
+            val oldest = list.minByOrNull { it.time } ?: break
+            oldest.file.delete()
+            list.remove(oldest)
+        }
+        save(list)
+        return item
+    }
+
+    /**
      * 删除单条记录（含音频文件）
      */
     fun delete(id: Long) {

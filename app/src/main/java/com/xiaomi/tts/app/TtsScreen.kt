@@ -132,6 +132,43 @@ class AudioStreamPlayer {
     }
 }
 
+/**
+ * 导出音频文件到系统音乐目录（流式，适合大文件）
+ */
+fun exportAudioFileToMusic(context: Context, wavFile: File): String {
+    val fileName = "xiaomi_tts_${System.currentTimeMillis()}.wav"
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+        val values = ContentValues().apply {
+            put(MediaStore.Audio.Media.DISPLAY_NAME, fileName)
+            put(MediaStore.Audio.Media.MIME_TYPE, "audio/wav")
+            put(MediaStore.Audio.Media.RELATIVE_PATH, Environment.DIRECTORY_MUSIC + "/XiaomiTTS")
+            put(MediaStore.Audio.Media.IS_PENDING, 1)
+        }
+        val resolver = context.contentResolver
+        val uri = resolver.insert(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, values)
+            ?: throw IOException("无法创建媒体文件")
+        resolver.openOutputStream(uri)?.use { out ->
+            wavFile.inputStream().use { it.copyTo(out) }
+        } ?: throw IOException("无法写入文件")
+        values.clear()
+        values.put(MediaStore.Audio.Media.IS_PENDING, 0)
+        resolver.update(uri, values, null, null)
+        return "Music/XiaomiTTS/$fileName"
+    } else {
+        @Suppress("DEPRECATION")
+        val dir = File(
+            Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MUSIC),
+            "XiaomiTTS"
+        )
+        if (!dir.exists()) dir.mkdirs()
+        val file = File(dir, fileName)
+        wavFile.inputStream().use { input ->
+            file.outputStream().use { input.copyTo(it) }
+        }
+        return file.absolutePath
+    }
+}
+
 // ── 分组标签选择对话框 ──
 @OptIn(ExperimentalLayoutApi::class, ExperimentalMaterial3Api::class)
 @Composable
@@ -307,6 +344,7 @@ fun TtsScreen() {
     var isNovelBuilding by remember { mutableStateOf(false) }
     var novelProgress by remember { mutableStateOf("") }
     var isAnalyzing by remember { mutableStateOf(false) }
+    var analyzeProgress by remember { mutableStateOf("") }
 
     fun refreshHistory() {
         history = HistoryStore.list()
@@ -351,11 +389,11 @@ fun TtsScreen() {
     }
 
     fun doExport() {
-        val data = audioData ?: return
+        val file = currentFile ?: return
         scope.launch {
             isExporting = true
             try {
-                val path = withContext(Dispatchers.IO) { exportAudioToMusic(context, data) }
+                val path = withContext(Dispatchers.IO) { exportAudioFileToMusic(context, file) }
                 Toast.makeText(context, "已导出: $path", Toast.LENGTH_LONG).show()
             } catch (e: Exception) {
                 errorMsg = "导出失败\n\n${e.message}"
@@ -523,12 +561,16 @@ fun TtsScreen() {
                         style = MaterialTheme.typography.bodySmall
                     )
 
-                    // 智能分析（LLM 推断说话人，可选）
+                    // 智能分析（LLM 推断说话人，可选；任意长度自动分块）
                     if (isAnalyzing) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
                             Spacer(Modifier.width(8.dp))
-                            Text("AI 分析中…（可能需要 30-60 秒）", style = MaterialTheme.typography.bodySmall)
+                            Text(
+                                if (analyzeProgress.isEmpty()) "AI 分析中…（可能需要 30-60 秒）"
+                                else "AI 分析中…（$analyzeProgress）",
+                                style = MaterialTheme.typography.bodySmall
+                            )
                         }
                     } else {
                         OutlinedButton(
@@ -539,13 +581,12 @@ fun TtsScreen() {
                                 }
                                 scope.launch {
                                     isAnalyzing = true
+                                    analyzeProgress = ""
                                     try {
-                                        val truncated =
-                                            if (novelFullText.length > XiaomiTtsClient.llmMaxChars())
-                                                "（文本较长，仅分析前 ${XiaomiTtsClient.llmMaxChars()} 字）"
-                                            else ""
                                         val segs = withContext(Dispatchers.IO) {
-                                            XiaomiTtsClient.llmAnalyze(apiKey, novelFullText)
+                                            XiaomiTtsClient.llmAnalyze(apiKey, novelFullText) { cur, total ->
+                                                analyzeProgress = "$cur / $total 块"
+                                            }
                                         }
                                         if (segs.isEmpty()) throw IOException("AI 未返回有效分段")
                                         novelSegments = segs
@@ -553,7 +594,7 @@ fun TtsScreen() {
                                         val newSp = NovelParser.speakers(segs)
                                         Toast.makeText(
                                             context,
-                                            "智能分析完成：${segs.size} 段，角色 ${newSp.size} 个$truncated",
+                                            "智能分析完成：${segs.size} 段，角色 ${newSp.size} 个",
                                             Toast.LENGTH_LONG
                                         ).show()
                                     } catch (e: Exception) {
@@ -624,28 +665,37 @@ fun TtsScreen() {
                             scope.launch {
                                 isNovelBuilding = true
                                 try {
-                                    val parts = mutableListOf<ByteArray>()
-                                    novelSegments.forEachIndexed { i, seg ->
-                                        novelProgress = "${i + 1}/${novelSegments.size}"
-                                        val wav = withContext(Dispatchers.IO) {
-                                            XiaomiTtsClient(apiKey).synthesize(
-                                                TtsRequest(
-                                                    model = "mimo-v2.5-tts",
-                                                    text = seg.text,
-                                                    voice = speakerVoices[seg.speaker] ?: "mimo_default"
+                                    // 流式落盘拼接：PCM 逐段追加写临时文件，大文件不驻留内存
+                                    val buildDir = File(context.cacheDir, "novel").apply { mkdirs() }
+                                    val pcmFile = File(buildDir, "build.pcm")
+                                    withContext(Dispatchers.IO) {
+                                        pcmFile.outputStream().use { out ->
+                                            novelSegments.forEachIndexed { i, seg ->
+                                                novelProgress = "${i + 1}/${novelSegments.size}"
+                                                val wav = XiaomiTtsClient(apiKey).synthesize(
+                                                    TtsRequest(
+                                                        model = "mimo-v2.5-tts",
+                                                        text = seg.text,
+                                                        voice = speakerVoices[seg.speaker] ?: "mimo_default"
+                                                    )
                                                 )
-                                            )
+                                                out.write(AudioConverter.wavToPcm(wav))
+                                            }
                                         }
-                                        parts += AudioConverter.wavToPcm(wav)
                                     }
-                                    val pcm = ByteArray(parts.sumOf { it.size })
-                                    var off = 0
-                                    parts.forEach {
-                                        System.arraycopy(it, 0, pcm, off, it.size)
-                                        off += it.size
+                                    val wavFile = File(buildDir, "build.wav")
+                                    withContext(Dispatchers.IO) {
+                                        AudioConverter.pcmFileToWav(pcmFile, 24000, 1, wavFile)
                                     }
-                                    val wav = AudioConverter.pcmToWav(pcm, 24000, 1)
-                                    finishResult(wav, "mimo-v2.5-tts", "小说广播剧", novelName ?: "novel")
+                                    pcmFile.delete()
+                                    withContext(Dispatchers.IO) {
+                                        val item = HistoryStore.addFile(
+                                            "mimo-v2.5-tts", "小说广播剧", novelName ?: "novel", wavFile
+                                        )
+                                        currentFile = item.file
+                                    }
+                                    refreshHistory()
+                                    if (autoPlay) currentFile?.let { playFile(it) }
                                     Toast.makeText(context, "广播剧生成完成！", Toast.LENGTH_LONG).show()
                                 } catch (e: Exception) {
                                     errorMsg = "广播剧生成失败（第 $novelProgress 段）\n\n${e.message}"
@@ -904,7 +954,7 @@ fun TtsScreen() {
             }
 
             // ── 结果操作（共用）──
-            if (audioData != null) {
+            if (audioData != null || currentFile != null) {
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Button(
                         onClick = {

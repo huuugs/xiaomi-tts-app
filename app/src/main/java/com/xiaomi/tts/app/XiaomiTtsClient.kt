@@ -96,10 +96,33 @@ class XiaomiTtsClient(private val apiKey: String) {
 
         /**
          * 调 MiMo 文本模型推断每段说话者（Token Plan 套餐内用量）
-         * 超长文本仅分析前 10000 字
+         * 任意长度：超过单块上限自动分块，块间传递已知角色名单保持命名一致
          */
-        fun llmAnalyze(apiKey: String, text: String): List<NovelSegment> {
-            val limited = if (text.length > LLM_MAX_CHARS) text.take(LLM_MAX_CHARS) else text
+        fun llmAnalyze(
+            apiKey: String,
+            text: String,
+            onProgress: (Int, Int) -> Unit = { _, _ -> }
+        ): List<NovelSegment> {
+            val chunks = if (text.length <= LLM_MAX_CHARS) listOf(text)
+            else text.chunked(LLM_MAX_CHARS)
+            val result = mutableListOf<NovelSegment>()
+            val knownSpeakers = linkedSetOf<String>()
+
+            chunks.forEachIndexed { i, chunk ->
+                onProgress(i + 1, chunks.size)
+                val segs = analyzeChunk(apiKey, chunk, knownSpeakers)
+                result += segs
+                segs.filter { it.isDialogue && it.speaker != "未标注" }
+                    .forEach { knownSpeakers.add(it.speaker) }
+            }
+            return result
+        }
+
+        private fun analyzeChunk(
+            apiKey: String,
+            chunk: String,
+            knownSpeakers: Set<String>
+        ): List<NovelSegment> {
             val system = "你是小说剧本分析助手。把用户给的小说文本切分为朗读分段并标注说话者。\n" +
                     "规则：\n" +
                     "1. 旁白与对白分开成段，保持原文顺序，不改动、不删减文本内容\n" +
@@ -107,6 +130,9 @@ class XiaomiTtsClient(private val apiKey: String) {
                     "3. 旁白的 speaker 固定填 旁白\n" +
                     "4. 同一角色名前后保持一致；完全无法判断的对白 speaker 填 未标注\n" +
                     "5. 超过 300 字的长段按句号切分\n" +
+                    (if (knownSpeakers.isNotEmpty())
+                        "已知角色（命名务必保持一致）：${knownSpeakers.joinToString("、")}\n"
+                    else "") +
                     "输出纯 JSON 数组（不要 markdown 代码块、不要任何解释文字）：\n" +
                     "[{\"speaker\":\"旁白\",\"isDialogue\":false,\"text\":\"……\"},{\"speaker\":\"角色名\",\"isDialogue\":true,\"text\":\"……\"}]"
 
@@ -114,7 +140,7 @@ class XiaomiTtsClient(private val apiKey: String) {
                 addProperty("model", LLM_MODEL)
                 add("messages", llmGson.toJsonTree(listOf(
                     mapOf("role" to "system", "content" to system),
-                    mapOf("role" to "user", "content" to limited)
+                    mapOf("role" to "user", "content" to chunk)
                 )))
                 addProperty("temperature", 0.1)
             }

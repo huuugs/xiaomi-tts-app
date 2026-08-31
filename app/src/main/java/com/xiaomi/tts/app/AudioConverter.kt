@@ -137,6 +137,32 @@ object AudioConverter {
     }
 
     /**
+     * PCM 文件流式封装 WAV（大文件不驻留内存）
+     */
+    fun pcmFileToWav(pcmFile: File, sampleRate: Int, channels: Int, outFile: File) {
+        val bitsPerSample = 16
+        val blockAlign = channels * bitsPerSample / 8
+        val byteRate = sampleRate * blockAlign
+        val dataSize = pcmFile.length()
+        java.io.DataOutputStream(java.io.BufferedOutputStream(FileOutputStream(outFile))).use { dos ->
+            fun le16(v: Long) {
+                dos.write((v and 0xFF).toInt()); dos.write(((v shr 8) and 0xFF).toInt())
+            }
+            fun le32(v: Long) {
+                dos.write((v and 0xFF).toInt()); dos.write(((v shr 8) and 0xFF).toInt())
+                dos.write(((v shr 16) and 0xFF).toInt()); dos.write(((v shr 24) and 0xFF).toInt())
+            }
+            fun str(s: String) = dos.write(s.toByteArray(Charsets.US_ASCII))
+
+            str("RIFF"); le32(36 + dataSize); str("WAVE")
+            str("fmt "); le32(16); le16(1); le16(channels.toLong())
+            le32(sampleRate.toLong()); le32(byteRate.toLong()); le16(blockAlign.toLong()); le16(bitsPerSample.toLong())
+            str("data"); le32(dataSize)
+            pcmFile.inputStream().use { it.copyTo(dos) }
+        }
+    }
+
+    /**
      * PCM16 封装 WAV 头（小端）
      */
     fun pcmToWav(pcm: ByteArray, sampleRate: Int, channels: Int): ByteArray {
